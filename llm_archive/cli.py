@@ -1,5 +1,9 @@
+import os
+import platform
+import subprocess
 from collections import defaultdict
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import click
 
@@ -9,9 +13,49 @@ from llm_archive.ingest import run_ingest
 MAX_GAP = timedelta(minutes=30)
 
 
+def _check_scheduler():
+    system = platform.system()
+    if system == "Darwin":
+        result = subprocess.run(
+            ["launchctl", "list", "com.llm-archive.ingest"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            click.secho("auto-ingest: active (launchd)", fg="green")
+        else:
+            click.secho("auto-ingest: not installed (run: llm-archive install-cron)", fg="yellow")
+    elif system == "Linux":
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "llm-archive-ingest.timer"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            click.secho("auto-ingest: active (systemd)", fg="green")
+        else:
+            # Check crontab fallback
+            result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+            if result.returncode == 0 and "llm-archive-ingest" in result.stdout:
+                click.secho("auto-ingest: active (crontab)", fg="green")
+            else:
+                click.secho("auto-ingest: not installed (run: llm-archive install-cron)", fg="yellow")
+
+    db_path = Path.home() / ".local" / "share" / "llm-archive" / "archive.db"
+    if db_path.exists():
+        mtime = datetime.fromtimestamp(db_path.stat().st_mtime)
+        age = datetime.now() - mtime
+        if age.days > 2:
+            click.secho(f"db: last updated {age.days} days ago", fg="yellow")
+        else:
+            click.secho(f"db: updated {mtime.strftime('%Y-%m-%d %H:%M')}", fg="green")
+    else:
+        click.secho("db: not found (run: llm-archive ingest)", fg="yellow")
+    click.echo()
+
+
 @click.group()
 def cli():
     """Ingest, search, and analyze LLM conversations."""
+    _check_scheduler()
 
 
 @cli.command()
