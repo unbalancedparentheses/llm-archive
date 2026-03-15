@@ -273,7 +273,7 @@ def day(date):
 @cli.command()
 @click.option("--days", default=7, help="Number of days to summarize")
 def summarize(days):
-    """Generate a summary of recent conversations using Claude API."""
+    """Generate a summary of recent conversations."""
     conn = db.get_connection()
     text = db.summarize_text(conn, days=days)
     conn.close()
@@ -282,13 +282,15 @@ def summarize(days):
         click.echo("No conversations in this period.")
         return
 
-    chars = min(len(text), 100_000)
-    est_input_tokens = chars // 4
-    est_cost = (est_input_tokens * 3.0 + 2000 * 15.0) / 1_000_000
-    if not click.confirm(f"This will send ~{est_input_tokens:,} tokens to Claude API (~${est_cost:.2f}). Continue?"):
+    from llm_archive.summarize import estimate_cost
+    cost_str, provider = estimate_cost(text, max_output_tokens=2000)
+    if provider == "none":
+        click.echo("No LLM provider available. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or install ollama.")
+        return
+    if not click.confirm(f"{cost_str}. Continue?"):
         return
 
-    click.echo(f"Summarizing last {days} days...")
+    click.echo(f"Summarizing last {days} days via {provider}...")
     from llm_archive.summarize import weekly_summary
     summary = weekly_summary(text, days=days)
     click.echo()
@@ -316,12 +318,15 @@ def ideas(days, project):
         click.echo("No conversations in this period.")
         return
 
-    chars = min(len(text), 100_000)
-    est_input_tokens = chars // 4
-    est_cost = (est_input_tokens * 3.0 + 4000 * 15.0) / 1_000_000
-    if not click.confirm(f"This will send ~{est_input_tokens:,} tokens to Claude API (~${est_cost:.2f}). Continue?"):
+    from llm_archive.summarize import estimate_cost
+    cost_str, provider = estimate_cost(text, max_output_tokens=4000)
+    if provider == "none":
+        click.echo("No LLM provider available. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or install ollama.")
+        return
+    if not click.confirm(f"{cost_str}. Continue?"):
         return
 
+    click.echo(f"Mining conversations via {provider}...")
     from llm_archive.summarize import extract_ideas
     result = extract_ideas(text, days=days)
     click.echo()

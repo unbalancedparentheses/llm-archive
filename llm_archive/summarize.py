@@ -1,4 +1,6 @@
-import anthropic
+import os
+import subprocess
+import json
 
 
 SUMMARY_SYSTEM = """You are analyzing a developer's LLM conversation history.
@@ -13,7 +15,26 @@ and things they wanted to build or explore but may not have followed through on.
 Be specific. Quote them when possible. Group by theme."""
 
 
-def _call_claude(system: str, prompt: str, max_tokens: int = 4000) -> str:
+def _detect_provider() -> str:
+    """Return 'anthropic', 'openai', or 'ollama' based on available keys/tools."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai"
+    # Check if ollama is running
+    try:
+        result = subprocess.run(
+            ["ollama", "list"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return "ollama"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return "none"
+
+
+def _call_anthropic(system: str, prompt: str, max_tokens: int) -> str:
+    import anthropic
     client = anthropic.Anthropic()
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -22,6 +43,72 @@ def _call_claude(system: str, prompt: str, max_tokens: int = 4000) -> str:
         messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text
+
+
+def _call_openai(system: str, prompt: str, max_tokens: int) -> str:
+    import openai
+    client = openai.OpenAI()
+    response = client.chat.completions.create(
+        model="gpt-4.1",
+        max_tokens=max_tokens,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.choices[0].message.content
+
+
+def _call_ollama(system: str, prompt: str, max_tokens: int) -> str:
+    payload = json.dumps({
+        "model": "llama3.2",
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "options": {"num_predict": max_tokens},
+    })
+    result = subprocess.run(
+        ["curl", "-s", "http://localhost:11434/api/chat", "-d", payload],
+        capture_output=True, text=True, timeout=300,
+    )
+    data = json.loads(result.stdout)
+    return data["message"]["content"]
+
+
+def _call_llm(system: str, prompt: str, max_tokens: int = 4000) -> tuple[str, str]:
+    """Call the best available LLM. Returns (response_text, provider_name)."""
+    provider = _detect_provider()
+
+    if provider == "anthropic":
+        return _call_anthropic(system, prompt, max_tokens), "claude"
+    elif provider == "openai":
+        return _call_openai(system, prompt, max_tokens), "openai"
+    elif provider == "ollama":
+        return _call_ollama(system, prompt, max_tokens), "ollama (local)"
+    else:
+        raise RuntimeError(
+            "No LLM provider available. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or install ollama."
+        )
+
+
+def estimate_cost(text: str, max_output_tokens: int) -> tuple[str, str]:
+    """Return (cost_estimate_string, provider_name)."""
+    provider = _detect_provider()
+    chars = min(len(text), 100_000)
+    input_tokens = chars // 4
+
+    if provider == "anthropic":
+        cost = (input_tokens * 3.0 + max_output_tokens * 15.0) / 1_000_000
+        return f"~{input_tokens:,} tokens → Claude API (~${cost:.2f})", provider
+    elif provider == "openai":
+        cost = (input_tokens * 2.0 + max_output_tokens * 8.0) / 1_000_000
+        return f"~{input_tokens:,} tokens → OpenAI API (~${cost:.2f})", provider
+    elif provider == "ollama":
+        return f"~{input_tokens:,} tokens → ollama local (free)", provider
+    else:
+        return "No LLM provider available", "none"
 
 
 def weekly_summary(text: str, days: int = 7) -> str:
@@ -38,7 +125,8 @@ Summarize:
 Conversations:
 {text}"""
 
-    return _call_claude(SUMMARY_SYSTEM, prompt, max_tokens=2000)
+    result, _ = _call_llm(SUMMARY_SYSTEM, prompt, max_tokens=2000)
+    return result
 
 
 def extract_ideas(text: str, days: int = 30) -> str:
@@ -65,4 +153,5 @@ Prioritize items that seem genuinely valuable or original over routine coding de
 Conversations:
 {text}"""
 
-    return _call_claude(IDEAS_SYSTEM, prompt, max_tokens=4000)
+    result, _ = _call_llm(IDEAS_SYSTEM, prompt, max_tokens=4000)
+    return result
