@@ -396,70 +396,39 @@ def export(days, project, source, fmt, output_dir):
 @cli.command()
 @click.option("--days", default=30, help="Number of days to analyze")
 def cost(days):
-    """Estimate API cost from message sizes."""
-    conn = db.get_connection()
-    rows = db.message_costs(conn, days=days)
-    conn.close()
+    """Show API cost from actual token usage in JSONL files."""
+    click.echo("Scanning raw JSONL files for token usage...")
+    from llm_archive.cost import compute_costs
+    data = compute_costs(days=days)
 
-    if not rows:
-        click.echo("No data in this period.")
+    by_source = data["by_source"]
+    by_project = data["by_project"]
+
+    if not by_source:
+        click.echo("No usage data found.")
         return
 
-    # Pricing per million tokens (approximate blended rates)
-    PRICING = {
-        "claude": {"input": 3.0, "output": 15.0},
-        "codex": {"input": 2.50, "output": 10.0},
-    }
-
-    by_source = defaultdict(lambda: {"input_chars": 0, "output_chars": 0})
-    by_project = defaultdict(lambda: {"input_chars": 0, "output_chars": 0})
-    by_day = defaultdict(lambda: {"input_chars": 0, "output_chars": 0})
-
-    for r in rows:
-        chars = r["chars"] or 0
-        key = "input_chars" if r["role"] == "user" else "output_chars"
-        by_source[r["source"]][key] += chars
-        by_project[r["project"]][key] += chars
-        by_day[r["day"]][key] += chars
-
-    def estimate_cost(source, input_chars, output_chars):
-        pricing = PRICING.get(source, PRICING["claude"])
-        input_tokens = input_chars / 4
-        output_tokens = output_chars / 4
-        return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
-
     total_cost = 0.0
 
-    click.secho("By source:", bold=True)
+    click.secho("\nBy source:", bold=True)
     for source in sorted(by_source):
         d = by_source[source]
-        c = estimate_cost(source, d["input_chars"], d["output_chars"])
-        total_cost += c  # don't double count - we'll recalculate total
-        input_tok = d["input_chars"] // 4
-        output_tok = d["output_chars"] // 4
-        click.echo(f"  {source:<10s}  ~{input_tok:>10,} input tok  ~{output_tok:>10,} output tok  ~${c:,.0f}")
-
-    # Recalculate total properly
-    total_cost = 0.0
-    for source, d in by_source.items():
-        total_cost += estimate_cost(source, d["input_chars"], d["output_chars"])
+        total_cost += d["cost"]
+        click.echo(
+            f"  {source:<10s}  {d['input_tokens']:>12,} input tok  "
+            f"{d['output_tokens']:>12,} output tok  ${d['cost']:,.2f}"
+        )
 
     click.echo()
     click.secho("By project (top 15):", bold=True)
-    project_costs = []
-    for project, d in by_project.items():
-        # Use blended source pricing - approximate with claude rates
-        c = estimate_cost("claude", d["input_chars"], d["output_chars"])
-        project_costs.append((project, c))
-    project_costs.sort(key=lambda x: x[1], reverse=True)
-    for project, c in project_costs[:15]:
-        if c < 0.5:
+    ranked = sorted(by_project.items(), key=lambda x: x[1]["cost"], reverse=True)
+    for project, d in ranked[:15]:
+        if d["cost"] < 0.50:
             continue
-        click.echo(f"  {project:<30s}  ~${c:,.0f}")
+        click.echo(f"  {project:<30s}  ${d['cost']:,.2f}")
 
     click.echo()
-    click.echo(f"Estimated total: ~${total_cost:,.0f} over {days} days")
-    click.secho("(Approximate: assumes chars/4 ≈ tokens, blended model pricing)", fg="yellow")
+    click.echo(f"Total: ${total_cost:,.2f} over {days} days")
 
 
 @cli.command()

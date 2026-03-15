@@ -270,13 +270,14 @@ def export_conversations(conn: sqlite3.Connection, days: int = 30, project: str 
     return results
 
 
-def message_costs(conn: sqlite3.Connection, days: int = 30) -> list[dict]:
+def conversation_message_sizes(conn: sqlite3.Connection, days: int = 30) -> list[dict]:
     sql = """
-        SELECT c.source, c.project, m.role, length(m.content) as chars,
-               date(m.timestamp) as day
-        FROM messages m
-        JOIN conversations c ON c.id = m.conversation_id
-        WHERE m.timestamp >= date('now', ?)
+        SELECT c.id as conv_id, c.source, c.project, date(c.started_at) as day,
+               m.role, length(m.content) as chars
+        FROM conversations c
+        JOIN messages m ON m.conversation_id = c.id
+        WHERE c.started_at >= date('now', ?)
+        ORDER BY c.id, m.timestamp
     """
     rows = conn.execute(sql, [f"-{days} days"]).fetchall()
     return [dict(r) for r in rows]
