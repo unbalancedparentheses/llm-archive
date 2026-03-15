@@ -282,6 +282,12 @@ def summarize(days):
         click.echo("No conversations in this period.")
         return
 
+    chars = min(len(text), 100_000)
+    est_input_tokens = chars // 4
+    est_cost = (est_input_tokens * 3.0 + 2000 * 15.0) / 1_000_000
+    if not click.confirm(f"This will send ~{est_input_tokens:,} tokens to Claude API (~${est_cost:.2f}). Continue?"):
+        return
+
     click.echo(f"Summarizing last {days} days...")
     from llm_archive.summarize import weekly_summary
     summary = weekly_summary(text, days=days)
@@ -294,6 +300,39 @@ def summarize(days):
     today = datetime.now().strftime("%Y-%m-%d")
     md_path = summaries_dir / f"{today}.md"
     md_path.write_text(f"# LLM Summary — {today} (last {days} days)\n\n{summary}\n")
+    click.secho(f"\nSaved to {md_path}", fg="green")
+
+
+@cli.command()
+@click.option("--days", default=30, help="Number of days to mine")
+@click.option("--project", default=None, help="Filter by project")
+def ideas(days, project):
+    """Find ideas, problems, arguments, and unexplored threads in your conversations."""
+    conn = db.get_connection()
+    text = db.summarize_text(conn, days=days)
+    conn.close()
+
+    if not text:
+        click.echo("No conversations in this period.")
+        return
+
+    chars = min(len(text), 100_000)
+    est_input_tokens = chars // 4
+    est_cost = (est_input_tokens * 3.0 + 4000 * 15.0) / 1_000_000
+    if not click.confirm(f"This will send ~{est_input_tokens:,} tokens to Claude API (~${est_cost:.2f}). Continue?"):
+        return
+
+    from llm_archive.summarize import extract_ideas
+    result = extract_ideas(text, days=days)
+    click.echo()
+    click.echo(result)
+
+    # Save to file
+    ideas_dir = Path.home() / ".local" / "share" / "llm-archive" / "ideas"
+    ideas_dir.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    md_path = ideas_dir / f"{today}.md"
+    md_path.write_text(f"# Ideas & Gems — {today} (last {days} days)\n\n{result}\n")
     click.secho(f"\nSaved to {md_path}", fg="green")
 
 
