@@ -22,9 +22,13 @@ llm-archive ingest
 # Ingest new conversations (incremental, safe to re-run)
 llm-archive ingest
 
-# Full-text search
+# Full-text search (keyword matching)
 llm-archive search "trusted boundary report"
 llm-archive search "how did we handle auth" --project holdco --source claude
+
+# Semantic search (search by meaning, not keywords)
+llm-archive embed                    # build index (one-time, ~5 min)
+llm-archive search --semantic "retry strategy for failed requests"
 
 # Drill into a specific day
 llm-archive day 2026-03-12
@@ -80,8 +84,9 @@ llm-archive stats
                                    messages(id, conv_id, role, content, timestamp)
                                            │
                                            ▼
-                              [search] [timeline] [hours] [projects] [cost]
-                              [summarize] [recurring] [topics] [export]
+                              [search] [search --semantic] [timeline] [hours]
+                              [projects] [cost] [ideas] [summarize]
+                              [recurring] [topics] [export] [embed]
 ```
 
 ## Project structure
@@ -98,6 +103,7 @@ llm-archive/
 │   ├── summarize.py     # multi-provider LLM calls
 │   ├── topics.py        # TF-IDF keyword extraction
 │   ├── cost.py          # actual token usage from JSONL
+│   ├── embeddings.py    # semantic search (ollama/sentence-transformers)
 │   └── parsers/
 │       ├── __init__.py  # shared types + normalize_project
 │       ├── claude.py    # Claude Code JSONL parser
@@ -143,6 +149,13 @@ llm-archive ideas --days 30
 
 ## Changelog
 
+### v0.4.0
+
+- `embed` — build semantic embedding index using ollama (nomic-embed-text) or sentence-transformers fallback
+- `search --semantic` — search by meaning instead of keywords, cosine similarity over embeddings
+- Incremental embedding — only processes new messages on subsequent runs
+- Embeddings stored as numpy `.npz` file (~150MB for 50k messages)
+
 ### v0.3.0
 
 - `ideas` — mine conversations for ideas, problems, arguments, and unexplored threads
@@ -178,5 +191,5 @@ llm-archive ideas --days 30
 
 - [x] v0.1 — Ingestion + FTS5 search + timeline + hours + day drill-down + recurring detection + Claude API summaries
 - [x] v0.2 — Auto-ingest, summary to markdown, per-project hours, Claude vs Codex split
-- [x] v0.3 — Topic extraction, conversation export, actual token cost tracking
-- [ ] v0.4 — Local embeddings (sentence-transformers) + semantic search + cross-project connections
+- [x] v0.3 — Topic extraction, conversation export, actual token cost tracking, ideas mining
+- [x] v0.4 — Semantic search with ollama embeddings (sentence-transformers fallback)
