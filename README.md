@@ -41,9 +41,11 @@ llm-archive projects --days 30
 # Claude vs Codex usage split
 llm-archive projects --by-source
 
-# Weekly summary via Claude API (needs ANTHROPIC_API_KEY)
-# Also saves to ~/.local/share/llm-archive/summaries/
+# Weekly summary (saves to ~/.local/share/llm-archive/summaries/)
 llm-archive summarize --days 7
+
+# Mine your conversations for ideas, problems, and unexplored threads
+llm-archive ideas --days 30
 
 # Extract topics from conversations (TF-IDF)
 llm-archive topics --days 30
@@ -93,7 +95,7 @@ llm-archive/
 │   ├── ingest.py        # wires parsers to db
 │   ├── strip.py         # remove code blocks
 │   ├── recurring.py     # trigram similarity clustering
-│   ├── summarize.py     # Claude API digest
+│   ├── summarize.py     # multi-provider LLM calls
 │   ├── topics.py        # TF-IDF keyword extraction
 │   ├── cost.py          # actual token usage from JSONL
 │   └── parsers/
@@ -101,6 +103,33 @@ llm-archive/
 │       ├── claude.py    # Claude Code JSONL parser
 │       └── codex.py     # Codex CLI JSONL parser
 └── pyproject.toml
+```
+
+## LLM providers
+
+The `summarize` and `ideas` commands need an LLM. Providers are tried in order — the first available one is used:
+
+| Priority | Provider | Env var | Model |
+|----------|----------|---------|-------|
+| 1 | Anthropic | `ANTHROPIC_API_KEY` | claude-sonnet-4 |
+| 2 | OpenAI | `OPENAI_API_KEY` | gpt-4.1 |
+| 3 | Kimi (Moonshot) | `MOONSHOT_API_KEY` | moonshot-v1-128k |
+| 4 | DeepSeek | `DEEPSEEK_API_KEY` | deepseek-chat |
+| 5 | Groq | `GROQ_API_KEY` | llama-3.3-70b |
+| 6 | Together | `TOGETHER_API_KEY` | Llama-3.3-70B |
+| 7 | Ollama (local) | — | auto-selects best installed model |
+
+If no API key is set, it falls back to **ollama** (free, runs locally). The command shows estimated cost before running and asks for confirmation. Ollama shows as "free".
+
+```bash
+# With API key
+export ANTHROPIC_API_KEY=sk-ant-...
+llm-archive ideas --days 30
+# ~25,000 tokens → Claude API (~$0.14). Continue? [y/N]
+
+# Without any API key (uses ollama)
+llm-archive ideas --days 30
+# ~25,000 tokens → ollama/qwen2.5:32b (free). Continue? [y/N]
 ```
 
 ## Stripping rules
@@ -116,9 +145,12 @@ llm-archive/
 
 ### v0.3.0
 
+- `ideas` — mine conversations for ideas, problems, arguments, and unexplored threads
 - `topics` — TF-IDF keyword extraction across conversations, shows dominant themes per project
 - `cost` — actual API cost from token usage in raw JSONL files (cache-aware pricing for Claude and Codex)
 - `export` — dump conversations to markdown or JSON files with `--project`, `--source`, `--format` filters
+- Multi-provider LLM support: Anthropic → OpenAI → Kimi → DeepSeek → Groq → Together → ollama (local, free)
+- Cost confirmation before any API call; ollama auto-selects best installed model
 
 ### v0.2.0
 
