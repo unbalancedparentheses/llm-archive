@@ -1,195 +1,151 @@
 # llm-archive
 
-A local tool to ingest, search, and analyze conversations from LLM coding assistants — stripping code to keep only the natural language exchange.
+Your LLM conversations are full of decisions, ideas, and context that disappear after each session. This tool saves them.
 
-## Supported sources
+It ingests conversations from Claude Code and Codex CLI, strips the code to keep only the natural language, and gives you search, analytics, and idea mining over everything you've discussed with AI.
 
-- **Claude Code** — parses `~/.claude/projects/**/*.jsonl`
-- **Codex CLI** — parses `~/.codex/sessions/**/*.jsonl` + `~/.codex/history.jsonl`
-
-Adding new sources (e.g., ChatGPT export JSON) is just another parser module.
-
-## Install
+## Quick start
 
 ```bash
 pip install -e .
-llm-archive ingest
+llm-archive ingest          # parse conversations into SQLite
+llm-archive embed           # build semantic search index (optional, needs ollama)
+llm-archive install-cron    # auto-ingest daily
 ```
 
-## CLI usage
+## What it does
 
+**Search** — find past conversations by keyword or meaning:
 ```bash
-# Ingest new conversations (incremental, safe to re-run)
-llm-archive ingest
-
-# Full-text search (keyword matching)
-llm-archive search "trusted boundary report"
-llm-archive search "how did we handle auth" --project holdco --source claude
-
-# Semantic search (search by meaning, not keywords)
-llm-archive embed                    # build index (one-time, ~5 min)
+llm-archive search "how did we handle auth" --project holdco
 llm-archive search --semantic "retry strategy for failed requests"
-
-# Drill into a specific day
-llm-archive day 2026-03-12
-
-# Daily project breakdown
-llm-archive timeline --days 30
-
-# Active usage hours per day
-llm-archive hours --days 30
-
-# Hours per project (where your time goes)
-llm-archive projects --days 30
-
-# Claude vs Codex usage split
-llm-archive projects --by-source
-
-# Weekly summary (saves to ~/.local/share/llm-archive/summaries/)
-llm-archive summarize --days 7
-
-# Mine your conversations for ideas, problems, and unexplored threads
-llm-archive ideas --days 30
-
-# Extract topics from conversations (TF-IDF)
-llm-archive topics --days 30
-
-# API cost from actual token usage in JSONL files
-llm-archive cost --days 30
-
-# Export conversations to markdown or JSON
-llm-archive export --days 7 --format md
-llm-archive export --project holdco --format json --output ./backup
-
-# Find questions you keep asking
-llm-archive recurring --days 30
-
-# Overview counts
-llm-archive stats
 ```
 
-## Architecture
+**Track your time** — see where your hours go:
+```bash
+llm-archive hours --days 30          # hours per day with visual bars
+llm-archive projects --days 30       # hours per project
+llm-archive projects --by-source     # Claude vs Codex split
+llm-archive timeline --days 14       # daily project breakdown
+```
+
+**Mine your thinking** — surface ideas you forgot about:
+```bash
+llm-archive ideas --days 30          # ideas, problems, arguments, unexplored threads
+llm-archive summarize --days 7       # weekly digest (saved to markdown)
+llm-archive topics --days 30         # dominant themes via TF-IDF
+llm-archive recurring --days 30      # questions you keep asking
+```
+
+**Know your costs** — actual token usage from raw JSONL files:
+```bash
+llm-archive cost --days 30           # breakdown by source and project
+```
+
+**Export and explore**:
+```bash
+llm-archive day 2026-03-12           # drill into a specific day
+llm-archive export --format md       # dump conversations to markdown
+llm-archive stats                    # overview counts
+```
+
+## Supported sources
+
+| Source | Path | Format |
+|--------|------|--------|
+| Claude Code | `~/.claude/projects/**/*.jsonl` | Messages with token usage |
+| Codex CLI | `~/.codex/sessions/**/*.jsonl` | Sessions with token counts |
+
+Adding a new source (e.g., ChatGPT export) is just another parser module in `llm_archive/parsers/`.
+
+## How it works
 
 ```
 ~/.claude/projects/**/*.jsonl  ──┐
-                                 ├──▶  [ingester]  ──▶  SQLite (FTS5)
-~/.codex/sessions/**/*.jsonl   ──┘         │
-                                           ▼
-                                    strip code blocks
-                                    strip tool calls
-                                    normalize to common schema
-                                           │
-                                           ▼
-                                   conversations(id, source, project, branch, started_at)
-                                   messages(id, conv_id, role, content, timestamp)
-                                           │
-                                           ▼
-                              [search] [search --semantic] [timeline] [hours]
-                              [projects] [cost] [ideas] [summarize]
-                              [recurring] [topics] [export] [embed]
+                                 ├──▶  strip code blocks    ──▶  SQLite (FTS5)
+~/.codex/sessions/**/*.jsonl   ──┘     strip tool calls          │
+                                       strip thinking blocks     ├──▶  keyword search
+                                       keep natural language     ├──▶  semantic search (embeddings)
+                                                                 ├──▶  analytics (hours, projects, cost)
+                                                                 └──▶  LLM analysis (ideas, summaries)
+```
+
+**What gets stripped**: fenced code blocks, tool_use/tool_result messages, thinking blocks, system prompts, developer messages.
+
+**What gets kept**: user questions, assistant explanations, commentary, inline code references.
+
+## LLM providers
+
+The `summarize` and `ideas` commands call an LLM to analyze your conversations. The first available provider is used:
+
+| Provider | Env var | Model | Cost |
+|----------|---------|-------|------|
+| Anthropic | `ANTHROPIC_API_KEY` | claude-sonnet-4 | ~$0.14/run |
+| OpenAI | `OPENAI_API_KEY` | gpt-4.1 | ~$0.10/run |
+| Kimi | `MOONSHOT_API_KEY` | moonshot-v1-128k | ~$0.03/run |
+| DeepSeek | `DEEPSEEK_API_KEY` | deepseek-chat | ~$0.01/run |
+| Groq | `GROQ_API_KEY` | llama-3.3-70b | ~$0.02/run |
+| Together | `TOGETHER_API_KEY` | Llama-3.3-70B | ~$0.02/run |
+| Ollama | — | auto-selects best local model | free |
+
+Every command shows estimated cost and asks for confirmation before calling the API. If no API key is set, it falls back to ollama.
+
+## Semantic search
+
+Keyword search finds exact words. Semantic search finds meaning — "error handling" matches conversations about exception catching, failure recovery, retry logic.
+
+```bash
+# First time: build the embedding index (~5 min)
+llm-archive embed
+
+# Then search by meaning
+llm-archive search --semantic "deploying to production"
+```
+
+Uses ollama with `nomic-embed-text` (free, local). Falls back to `sentence-transformers` if ollama isn't available. Incremental — re-running `embed` only processes new messages.
+
+## Auto-ingest
+
+Run `llm-archive install-cron` to set up daily automatic ingestion:
+
+- **macOS**: launchd agent (runs at 06:00 + on login)
+- **Linux**: systemd user timer, or crontab fallback
+
+The CLI shows ingestion status on every command:
+```
+auto-ingest: active (launchd)
+db: updated 2026-03-15 02:55
 ```
 
 ## Project structure
 
 ```
-llm-archive/
-├── llm_archive/
-│   ├── __init__.py
-│   ├── cli.py           # click CLI
-│   ├── db.py            # SQLite + FTS5
-│   ├── ingest.py        # wires parsers to db
-│   ├── strip.py         # remove code blocks
-│   ├── recurring.py     # trigram similarity clustering
-│   ├── summarize.py     # multi-provider LLM calls
-│   ├── topics.py        # TF-IDF keyword extraction
-│   ├── cost.py          # actual token usage from JSONL
-│   ├── embeddings.py    # semantic search (ollama/sentence-transformers)
-│   └── parsers/
-│       ├── __init__.py  # shared types + normalize_project
-│       ├── claude.py    # Claude Code JSONL parser
-│       └── codex.py     # Codex CLI JSONL parser
-└── pyproject.toml
+llm_archive/
+├── cli.py           # click CLI (all commands)
+├── db.py            # SQLite + FTS5 schema and queries
+├── ingest.py        # wires parsers to database
+├── strip.py         # remove code blocks from text
+├── embeddings.py    # semantic search (ollama / sentence-transformers)
+├── summarize.py     # multi-provider LLM calls (ideas, summaries)
+├── topics.py        # TF-IDF keyword extraction
+├── cost.py          # actual token usage from raw JSONL
+├── recurring.py     # trigram similarity clustering
+├── scheduler.py     # launchd / systemd / crontab setup
+└── parsers/
+    ├── __init__.py  # shared types + project name normalization
+    ├── claude.py    # Claude Code JSONL parser
+    └── codex.py     # Codex CLI JSONL parser
 ```
 
-## LLM providers
+## Data storage
 
-The `summarize` and `ideas` commands need an LLM. Providers are tried in order — the first available one is used:
+Everything lives under `~/.local/share/llm-archive/`:
 
-| Priority | Provider | Env var | Model |
-|----------|----------|---------|-------|
-| 1 | Anthropic | `ANTHROPIC_API_KEY` | claude-sonnet-4 |
-| 2 | OpenAI | `OPENAI_API_KEY` | gpt-4.1 |
-| 3 | Kimi (Moonshot) | `MOONSHOT_API_KEY` | moonshot-v1-128k |
-| 4 | DeepSeek | `DEEPSEEK_API_KEY` | deepseek-chat |
-| 5 | Groq | `GROQ_API_KEY` | llama-3.3-70b |
-| 6 | Together | `TOGETHER_API_KEY` | Llama-3.3-70B |
-| 7 | Ollama (local) | — | auto-selects best installed model |
-
-If no API key is set, it falls back to **ollama** (free, runs locally). The command shows estimated cost before running and asks for confirmation. Ollama shows as "free".
-
-```bash
-# With API key
-export ANTHROPIC_API_KEY=sk-ant-...
-llm-archive ideas --days 30
-# ~25,000 tokens → Claude API (~$0.14). Continue? [y/N]
-
-# Without any API key (uses ollama)
-llm-archive ideas --days 30
-# ~25,000 tokens → ollama/qwen2.5:32b (free). Continue? [y/N]
-```
-
-## Stripping rules
-
-- Remove fenced code blocks
-- Remove tool_use / tool_result messages
-- Remove thinking blocks
-- Remove system prompts and developer messages
-- Keep inline code references
-- Keep user questions, assistant explanations, commentary
-
-## Changelog
-
-### v0.4.0
-
-- `embed` — build semantic embedding index using ollama (nomic-embed-text) or sentence-transformers fallback
-- `search --semantic` — search by meaning instead of keywords, cosine similarity over embeddings
-- Incremental embedding — only processes new messages on subsequent runs
-- Embeddings stored as numpy `.npz` file (~150MB for 50k messages)
-
-### v0.3.0
-
-- `ideas` — mine conversations for ideas, problems, arguments, and unexplored threads
-- `topics` — TF-IDF keyword extraction across conversations, shows dominant themes per project
-- `cost` — actual API cost from token usage in raw JSONL files (cache-aware pricing for Claude and Codex)
-- `export` — dump conversations to markdown or JSON files with `--project`, `--source`, `--format` filters
-- Multi-provider LLM support: Anthropic → OpenAI → Kimi → DeepSeek → Groq → Together → ollama (local, free)
-- Cost confirmation before any API call; ollama auto-selects best installed model
-
-### v0.2.0
-
-- `projects` — active hours per project with visual bars and percentages
-- `projects --by-source` — Claude vs Codex usage split per project
-- `summarize` now saves digests to `~/.local/share/llm-archive/summaries/YYYY-MM-DD.md`
-- `install-cron` / `uninstall-cron` — automatic daily ingestion (launchd/systemd/crontab)
-- Startup health check showing auto-ingest status and DB freshness
-
-### v0.1.0
-
-- Parsers for Claude Code and Codex CLI JSONL formats
-- Incremental ingestion into SQLite with FTS5 full-text search
-- Project name normalization across sources (dots, underscores, hyphens unified)
-- `ingest` — parse and store new conversations
-- `search` — full-text search with `--project` and `--source` filters
-- `stats` — overview counts by source and project
-- `timeline` — daily project breakdown with conversation/message counts
-- `hours` — active usage hours per day (30-min gap threshold, visual bars)
-- `day` — drill into a specific date, shows each conversation with timestamp and first user message
-- `summarize` — weekly/monthly digest via Claude API
-- `recurring` — finds repeated questions using trigram similarity, filters system noise
-
-## Roadmap
-
-- [x] v0.1 — Ingestion + FTS5 search + timeline + hours + day drill-down + recurring detection + Claude API summaries
-- [x] v0.2 — Auto-ingest, summary to markdown, per-project hours, Claude vs Codex split
-- [x] v0.3 — Topic extraction, conversation export, actual token cost tracking, ideas mining
-- [x] v0.4 — Semantic search with ollama embeddings (sentence-transformers fallback)
+| File | Purpose |
+|------|---------|
+| `archive.db` | SQLite database with FTS5 index |
+| `embeddings.npz` | Semantic search vectors (~150MB for 50k messages) |
+| `embeddings_meta.json` | Embedding provider and dimension info |
+| `summaries/YYYY-MM-DD.md` | Generated weekly digests |
+| `ideas/YYYY-MM-DD.md` | Mined ideas and insights |
+| `ingest.log` | Auto-ingest log |
