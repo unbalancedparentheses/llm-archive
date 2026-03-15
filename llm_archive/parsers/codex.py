@@ -3,14 +3,14 @@ import os
 from collections.abc import Iterator
 from pathlib import Path
 
-from llm_archive.parsers import ParsedConversation, ParsedMessage
+from llm_archive.parsers import ParsedConversation, ParsedMessage, normalize_project
 from llm_archive.strip import strip_code_blocks
 
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 
 
 def _extract_project(cwd: str) -> str:
-    return os.path.basename(cwd) if cwd else "unknown"
+    return normalize_project(os.path.basename(cwd)) if cwd else "unknown"
 
 
 def _extract_text(content, text_type: str) -> str:

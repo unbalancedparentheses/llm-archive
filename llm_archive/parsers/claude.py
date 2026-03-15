@@ -3,7 +3,7 @@ import os
 from collections.abc import Iterator
 from pathlib import Path
 
-from llm_archive.parsers import ParsedConversation, ParsedMessage
+from llm_archive.parsers import ParsedConversation, ParsedMessage, normalize_project
 from llm_archive.strip import strip_code_blocks
 
 CLAUDE_BASE = Path.home() / ".claude" / "projects"
@@ -49,7 +49,7 @@ def parse_claude_sessions() -> Iterator[ParsedConversation]:
         if not project_dir.is_dir():
             continue
 
-        project = _extract_project(project_dir.name)
+        project = normalize_project(_extract_project(project_dir.name))
 
         for jsonl_file in project_dir.glob("*.jsonl"):
             conv = _parse_session(jsonl_file, project)

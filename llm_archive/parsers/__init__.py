@@ -1,4 +1,18 @@
+import re
 from dataclasses import dataclass, field
+
+
+_HOME_ALIASES = {"unbalancedparen", "projects", "(home)", ""}
+
+
+def normalize_project(name: str) -> str:
+    name = name.lower().strip()
+    name = re.sub(r"[._]+", "-", name)
+    name = re.sub(r"-+", "-", name)
+    name = name.strip("-")
+    if name in _HOME_ALIASES:
+        return "(home)"
+    return name or "unknown"
 
 
 @dataclass
