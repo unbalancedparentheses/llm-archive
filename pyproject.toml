@@ -1,0 +1,13 @@
+[project]
+name = "llm-archive"
+version = "0.1.0"
+description = "Ingest, search, and analyze LLM coding assistant conversations"
+requires-python = ">=3.10"
+dependencies = ["click>=8.0"]
+
+[project.scripts]
+llm-archive = "llm_archive.cli:cli"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
