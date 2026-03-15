@@ -66,28 +66,73 @@ def ingest():
 
 
 @cli.command()
+@click.option("--rebuild", is_flag=True, help="Rebuild all embeddings from scratch")
+def embed(rebuild):
+    """Build or update the semantic embedding index."""
+    from llm_archive.embeddings import build_embeddings, get_provider
+
+    provider, dim = get_provider()
+    click.echo(f"Embedding provider: {provider} ({dim} dimensions)")
+
+    conn = db.get_connection()
+
+    def progress(done, total):
+        click.echo(f"  {done}/{total} messages embedded...", nl=False)
+        click.echo("\r", nl=False)
+
+    new, total = build_embeddings(conn, rebuild=rebuild, progress_fn=progress)
+    conn.close()
+
+    if new > 0:
+        click.echo(f"\nEmbedded {new} new messages ({total} total)")
+    else:
+        click.echo(f"Already up to date ({total} messages embedded)")
+
+
+@cli.command()
 @click.argument("query")
 @click.option("--project", default=None, help="Filter by project name")
 @click.option("--source", type=click.Choice(["claude", "codex"]), default=None)
 @click.option("--limit", default=20, help="Max results")
-def search(query, project, source, limit):
+@click.option("--semantic", is_flag=True, help="Use semantic similarity (requires: llm-archive embed)")
+def search(query, project, source, limit, semantic):
     """Full-text search across conversations."""
     conn = db.get_connection()
-    results = db.search(conn, query, project=project, source=source, limit=limit)
-    conn.close()
 
-    if not results:
-        click.echo("No results found.")
-        return
+    if semantic:
+        from llm_archive.embeddings import semantic_search
+        results = semantic_search(conn, query, project=project, source=source, limit=limit)
+        conn.close()
 
-    for r in results:
-        header = f"[{r['source']}/{r['project']}]"
-        if r["git_branch"]:
-            header += f" ({r['git_branch']})"
-        header += f" {r['timestamp']}"
-        click.secho(header, fg="cyan")
-        click.echo(f"  {r['role']}: {r['snippet']}")
-        click.echo()
+        if not results:
+            click.echo("No results found.")
+            return
+
+        for r in results:
+            score = click.style(f"{r['score']:.3f}", fg="yellow")
+            header = f"[{r['source']}/{r['project']}]"
+            if r["git_branch"]:
+                header += f" ({r['git_branch']})"
+            header += f" {r['timestamp']}  score={score}"
+            click.secho(header, fg="cyan")
+            click.echo(f"  {r['role']}: {r['snippet']}")
+            click.echo()
+    else:
+        results = db.search(conn, query, project=project, source=source, limit=limit)
+        conn.close()
+
+        if not results:
+            click.echo("No results found.")
+            return
+
+        for r in results:
+            header = f"[{r['source']}/{r['project']}]"
+            if r["git_branch"]:
+                header += f" ({r['git_branch']})"
+            header += f" {r['timestamp']}"
+            click.secho(header, fg="cyan")
+            click.echo(f"  {r['role']}: {r['snippet']}")
+            click.echo()
 
 
 @cli.command()

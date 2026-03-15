@@ -320,3 +320,49 @@ def user_messages(conn: sqlite3.Connection, days: int = 30) -> list[dict]:
     """
     rows = conn.execute(sql, [f"-{days} days"]).fetchall()
     return [dict(r) for r in rows]
+
+
+def all_message_ids(conn: sqlite3.Connection) -> list[int]:
+    return [r[0] for r in conn.execute("SELECT id FROM messages").fetchall()]
+
+
+def get_message_texts(conn: sqlite3.Connection, ids: list[int]) -> list[tuple[int, str]]:
+    if not ids:
+        return []
+    # Process in batches to avoid SQLite variable limit
+    results = []
+    for i in range(0, len(ids), 500):
+        batch = ids[i:i + 500]
+        placeholders = ",".join("?" * len(batch))
+        rows = conn.execute(
+            f"SELECT id, content FROM messages WHERE id IN ({placeholders})", batch
+        ).fetchall()
+        results.extend((r[0], r[1]) for r in rows)
+    return results
+
+
+def get_messages_by_ids(
+    conn: sqlite3.Connection,
+    ids: list[int],
+    project: str | None = None,
+    source: str | None = None,
+) -> list[dict]:
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    sql = f"""
+        SELECT m.id, m.content, m.role, m.timestamp,
+               c.source, c.project, c.git_branch
+        FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        WHERE m.id IN ({placeholders})
+    """
+    params: list = list(ids)
+    if project:
+        sql += " AND c.project = ?"
+        params.append(project)
+    if source:
+        sql += " AND c.source = ?"
+        params.append(source)
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
