@@ -111,6 +111,78 @@ def hours(days):
 
 
 @cli.command()
+@click.argument("date")
+def day(date):
+    """Drill into a specific day. Usage: llm-archive day 2026-03-12"""
+    conn = db.get_connection()
+    rows = db.day_detail(conn, date)
+    conn.close()
+
+    if not rows:
+        click.echo(f"No conversations on {date}.")
+        return
+
+    click.secho(f"{date} — {len(rows)} conversations\n", fg="green", bold=True)
+    for r in rows:
+        time = r["start_time"] or "??:??"
+        source_tag = click.style(f"[{r['source']}]", fg="cyan")
+        question = (r["first_question"] or "")[:120].replace("\n", " ")
+        click.echo(f"  {time} UTC  {source_tag} {r['project']} ({r['msgs']} msgs)")
+        if question:
+            click.echo(f"    {question}")
+        click.echo()
+
+
+@cli.command()
+@click.option("--days", default=7, help="Number of days to summarize")
+def summarize(days):
+    """Generate a summary of recent conversations using Claude API."""
+    conn = db.get_connection()
+    text = db.summarize_text(conn, days=days)
+    conn.close()
+
+    if not text:
+        click.echo("No conversations in this period.")
+        return
+
+    click.echo(f"Summarizing last {days} days...")
+    from llm_archive.summarize import weekly_summary
+    summary = weekly_summary(text, days=days)
+    click.echo()
+    click.echo(summary)
+
+
+@cli.command()
+@click.option("--days", default=30, help="Number of days to analyze")
+@click.option("--threshold", default=0.4, help="Similarity threshold (0-1)")
+@click.option("--min-count", default=3, help="Minimum occurrences to report")
+def recurring(days, threshold, min_count):
+    """Find questions you keep asking."""
+    conn = db.get_connection()
+    messages = db.user_messages(conn, days=days)
+    conn.close()
+
+    if not messages:
+        click.echo("No user messages in this period.")
+        return
+
+    from llm_archive.recurring import find_recurring
+    clusters = find_recurring(messages, threshold=threshold, min_cluster=min_count)
+
+    if not clusters:
+        click.echo("No recurring patterns found.")
+        return
+
+    click.echo(f"Found {len(clusters)} recurring patterns:\n")
+    for c in clusters[:20]:
+        projects = ", ".join(c["projects"])
+        click.secho(f"  {c['count']}x across [{projects}]", fg="yellow")
+        click.echo(f"    \"{c['example']}\"")
+        click.echo(f"    {c['first'][:10]} — {c['last'][:10]}")
+        click.echo()
+
+
+@cli.command()
 def stats():
     """Show ingestion statistics."""
     conn = db.get_connection()

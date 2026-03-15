@@ -190,3 +190,60 @@ def message_timestamps(conn: sqlite3.Connection, days: int = 30) -> list[tuple[s
         ORDER BY m.timestamp
     """
     return conn.execute(sql, [f"-{days} days"]).fetchall()
+
+
+def day_detail(conn: sqlite3.Connection, date: str) -> list[dict]:
+    sql = """
+        SELECT c.id, c.source, c.project, c.session_id,
+               time(c.started_at) as start_time,
+               COUNT(m.id) as msgs,
+               (SELECT content FROM messages
+                WHERE conversation_id = c.id AND role = 'user'
+                ORDER BY timestamp LIMIT 1) as first_question
+        FROM conversations c
+        JOIN messages m ON m.conversation_id = c.id
+        WHERE date(c.started_at) = ?
+        GROUP BY c.id
+        ORDER BY c.started_at
+    """
+    rows = conn.execute(sql, [date]).fetchall()
+    return [dict(r) for r in rows]
+
+
+def summarize_text(conn: sqlite3.Connection, days: int = 7) -> str:
+    sql = """
+        SELECT c.source, c.project, m.role, m.content, m.timestamp
+        FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        WHERE m.timestamp >= date('now', ?)
+        ORDER BY m.timestamp
+    """
+    rows = conn.execute(sql, [f"-{days} days"]).fetchall()
+
+    parts = []
+    for r in rows:
+        parts.append(f"[{r['source']}/{r['project']}] {r['role']}: {r['content'][:500]}")
+    return "\n".join(parts)
+
+
+def user_messages(conn: sqlite3.Connection, days: int = 30) -> list[dict]:
+    sql = """
+        SELECT m.content, c.project, m.timestamp
+        FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        WHERE m.role = 'user' AND m.timestamp >= date('now', ?)
+          AND length(m.content) > 20
+          AND m.content NOT LIKE '%<task-notification>%'
+          AND m.content NOT LIKE '%<turn_aborted>%'
+          AND m.content NOT LIKE '%<local-command%'
+          AND m.content NOT LIKE '%<command-name>%'
+          AND m.content NOT LIKE '%<environment_context>%'
+          AND m.content NOT LIKE '%AGENTS.md instructions%'
+          AND m.content NOT LIKE '%Request interrupted by user%'
+          AND m.content NOT LIKE '%session is being continued%'
+          AND m.content NOT LIKE '%<image %'
+          AND m.content NOT LIKE '%Set model to%'
+        ORDER BY m.timestamp
+    """
+    rows = conn.execute(sql, [f"-{days} days"]).fetchall()
+    return [dict(r) for r in rows]
