@@ -156,43 +156,92 @@ def hours(days):
 
 @cli.command()
 @click.option("--days", default=30, help="Number of days to analyze")
-def projects(days):
+@click.option("--by-source", is_flag=True, help="Break down by source (Claude vs Codex)")
+def projects(days, by_source):
     """Show active hours per project."""
     conn = db.get_connection()
     rows = db.project_timestamps(conn, days=days)
     conn.close()
 
-    by_project = defaultdict(list)
-    for project, day, ts in rows:
-        try:
-            t = datetime.fromisoformat(ts[:19].replace("T", " "))
-            by_project[project].append(t)
-        except ValueError:
-            continue
+    if by_source:
+        by_key = defaultdict(list)
+        for project, day, ts, source in rows:
+            try:
+                t = datetime.fromisoformat(ts[:19].replace("T", " "))
+                by_key[(project, source)].append(t)
+            except ValueError:
+                continue
 
-    if not by_project:
-        click.echo("No data in this period.")
-        return
+        if not by_key:
+            click.echo("No data in this period.")
+            return
 
-    project_hours = {}
-    for project, timestamps in by_project.items():
-        timestamps.sort()
-        active = timedelta()
-        for i in range(1, len(timestamps)):
-            gap = timestamps[i] - timestamps[i - 1]
-            if gap <= MAX_GAP:
-                active += gap
-        project_hours[project] = active.total_seconds() / 3600
+        key_hours = {}
+        for key, timestamps in by_key.items():
+            timestamps.sort()
+            active = timedelta()
+            for i in range(1, len(timestamps)):
+                gap = timestamps[i] - timestamps[i - 1]
+                if gap <= MAX_GAP:
+                    active += gap
+            key_hours[key] = active.total_seconds() / 3600
 
-    ranked = sorted(project_hours.items(), key=lambda x: x[1], reverse=True)
-    total = sum(h for _, h in ranked)
+        ranked = sorted(key_hours.items(), key=lambda x: x[1], reverse=True)
+        total = sum(h for _, h in ranked)
 
-    for project, h in ranked:
-        if h < 0.1:
-            continue
-        pct = (h / total * 100) if total > 0 else 0
-        bar = click.style("█" * int(h), fg="green")
-        click.echo(f"  {project:<30s} {h:5.1f}h  {pct:4.0f}%  {bar}")
+        # Source totals
+        source_totals = defaultdict(float)
+        for (project, source), h in ranked:
+            source_totals[source] += h
+
+        click.secho("By source:", bold=True)
+        for source in sorted(source_totals, key=source_totals.get, reverse=True):
+            h = source_totals[source]
+            pct = (h / total * 100) if total > 0 else 0
+            bar = click.style("█" * int(h), fg="green")
+            click.echo(f"  {source:<10s} {h:5.1f}h  {pct:4.0f}%  {bar}")
+        click.echo()
+
+        click.secho("By project + source:", bold=True)
+        for (project, source), h in ranked:
+            if h < 0.1:
+                continue
+            pct = (h / total * 100) if total > 0 else 0
+            label = f"{project} [{source}]"
+            bar = click.style("█" * int(h), fg="green")
+            click.echo(f"  {label:<40s} {h:5.1f}h  {pct:4.0f}%  {bar}")
+    else:
+        by_project = defaultdict(list)
+        for project, day, ts, source in rows:
+            try:
+                t = datetime.fromisoformat(ts[:19].replace("T", " "))
+                by_project[project].append(t)
+            except ValueError:
+                continue
+
+        if not by_project:
+            click.echo("No data in this period.")
+            return
+
+        project_hours = {}
+        for project, timestamps in by_project.items():
+            timestamps.sort()
+            active = timedelta()
+            for i in range(1, len(timestamps)):
+                gap = timestamps[i] - timestamps[i - 1]
+                if gap <= MAX_GAP:
+                    active += gap
+            project_hours[project] = active.total_seconds() / 3600
+
+        ranked = sorted(project_hours.items(), key=lambda x: x[1], reverse=True)
+        total = sum(h for _, h in ranked)
+
+        for project, h in ranked:
+            if h < 0.1:
+                continue
+            pct = (h / total * 100) if total > 0 else 0
+            bar = click.style("█" * int(h), fg="green")
+            click.echo(f"  {project:<30s} {h:5.1f}h  {pct:4.0f}%  {bar}")
 
     click.echo()
     click.echo(f"Total: {total:.0f}h across {len(ranked)} projects ({days} days)")

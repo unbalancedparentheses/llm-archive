@@ -35,7 +35,14 @@ llm-archive timeline --days 30
 # Active usage hours per day
 llm-archive hours --days 30
 
+# Hours per project (where your time goes)
+llm-archive projects --days 30
+
+# Claude vs Codex usage split
+llm-archive projects --by-source
+
 # Weekly summary via Claude API (needs ANTHROPIC_API_KEY)
+# Also saves to ~/.local/share/llm-archive/summaries/
 llm-archive summarize --days 7
 
 # Find questions you keep asking
@@ -94,6 +101,14 @@ llm-archive/
 
 ## Changelog
 
+### v0.2.0
+
+- `projects` — active hours per project with visual bars and percentages
+- `projects --by-source` — Claude vs Codex usage split per project
+- `summarize` now saves digests to `~/.local/share/llm-archive/summaries/YYYY-MM-DD.md`
+- `install-cron` / `uninstall-cron` — automatic daily ingestion (launchd/systemd/crontab)
+- Startup health check showing auto-ingest status and DB freshness
+
 ### v0.1.0
 
 - Parsers for Claude Code and Codex CLI JSONL formats
@@ -111,6 +126,6 @@ llm-archive/
 ## Roadmap
 
 - [x] v0.1 — Ingestion + FTS5 search + timeline + hours + day drill-down + recurring detection + Claude API summaries
-- [ ] v0.2 — Automatic daily ingestion (launchd), summary output to Obsidian or markdown files
-- [ ] v0.3 — Stats and patterns: time-per-project, Claude vs Codex usage split, topic extraction
+- [x] v0.2 — Auto-ingest, summary to markdown, per-project hours, Claude vs Codex split
+- [ ] v0.3 — Topic extraction, conversation export, cost estimation
 - [ ] v0.4 — Local embeddings (sentence-transformers) + semantic search + cross-project connections

@@ -192,9 +192,9 @@ def message_timestamps(conn: sqlite3.Connection, days: int = 30) -> list[tuple[s
     return conn.execute(sql, [f"-{days} days"]).fetchall()
 
 
-def project_timestamps(conn: sqlite3.Connection, days: int = 30) -> list[tuple[str, str, str]]:
+def project_timestamps(conn: sqlite3.Connection, days: int = 30) -> list[tuple[str, str, str, str]]:
     sql = """
-        SELECT c.project, date(m.timestamp) as day, m.timestamp
+        SELECT c.project, date(m.timestamp) as day, m.timestamp, c.source
         FROM messages m
         JOIN conversations c ON c.id = m.conversation_id
         WHERE m.timestamp != '' AND m.timestamp >= date('now', ?)
