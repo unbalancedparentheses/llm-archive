@@ -182,6 +182,22 @@ def recurring(days, threshold, min_count):
         click.echo()
 
 
+@cli.command(name="install-cron")
+def install_cron():
+    """Set up daily automatic ingestion (launchd/systemd/crontab)."""
+    from llm_archive.scheduler import install
+    result = install()
+    click.echo(result)
+
+
+@cli.command(name="uninstall-cron")
+def uninstall_cron():
+    """Remove daily automatic ingestion."""
+    from llm_archive.scheduler import uninstall
+    result = uninstall()
+    click.echo(result)
+
+
 @cli.command()
 def stats():
     """Show ingestion statistics."""
