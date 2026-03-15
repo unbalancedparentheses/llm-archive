@@ -143,6 +143,9 @@ def _best_ollama_model() -> str:
 
 
 def _call_ollama(system: str, prompt: str, max_tokens: int) -> str:
+    import sys
+    import urllib.request
+
     model = _best_ollama_model()
     payload = json.dumps({
         "model": model,
@@ -150,15 +153,28 @@ def _call_ollama(system: str, prompt: str, max_tokens: int) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
-        "stream": False,
+        "stream": True,
         "options": {"num_predict": max_tokens},
-    })
-    result = subprocess.run(
-        ["curl", "-s", "http://localhost:11434/api/chat", "-d", payload],
-        capture_output=True, text=True, timeout=600,
+    }).encode()
+
+    req = urllib.request.Request(
+        "http://localhost:11434/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
-    data = json.loads(result.stdout)
-    return data["message"]["content"]
+
+    full_response = []
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        for line in resp:
+            chunk = json.loads(line)
+            token = chunk.get("message", {}).get("content", "")
+            if token:
+                sys.stderr.write(token)
+                sys.stderr.flush()
+                full_response.append(token)
+    sys.stderr.write("\n")
+    return "".join(full_response)
 
 
 _CALLERS = {
