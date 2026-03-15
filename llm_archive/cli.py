@@ -344,6 +344,153 @@ def uninstall_cron():
 
 
 @cli.command()
+@click.option("--days", default=30, help="Number of days to export")
+@click.option("--project", default=None, help="Filter by project")
+@click.option("--source", type=click.Choice(["claude", "codex"]), default=None)
+@click.option("--format", "fmt", type=click.Choice(["md", "json"]), default="md", help="Output format")
+@click.option("--output", "output_dir", default=None, help="Output directory (default: ./llm-export)")
+def export(days, project, source, fmt, output_dir):
+    """Export conversations to markdown or JSON files."""
+    conn = db.get_connection()
+    convs = db.export_conversations(conn, days=days, project=project, source=source)
+    conn.close()
+
+    if not convs:
+        click.echo("No conversations to export.")
+        return
+
+    out = Path(output_dir) if output_dir else Path("llm-export")
+    out.mkdir(parents=True, exist_ok=True)
+
+    for c in convs:
+        date = (c["started_at"] or "unknown")[:10]
+        safe_project = c["project"].replace("/", "-")
+        filename = f"{date}_{safe_project}_{c['session_id'][:8]}"
+
+        if fmt == "md":
+            lines = [
+                f"# {c['project']} — {c['started_at']}",
+                f"",
+                f"**Source:** {c['source']}",
+            ]
+            if c["git_branch"]:
+                lines.append(f"**Branch:** {c['git_branch']}")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+            for m in c["messages"]:
+                role_label = "User" if m["role"] == "user" else "Assistant"
+                lines.append(f"### {role_label}")
+                lines.append("")
+                lines.append(m["content"])
+                lines.append("")
+
+            (out / f"{filename}.md").write_text("\n".join(lines))
+        else:
+            import json
+            (out / f"{filename}.json").write_text(json.dumps(c, indent=2, ensure_ascii=False))
+
+    click.echo(f"Exported {len(convs)} conversations to {out}/")
+
+
+@cli.command()
+@click.option("--days", default=30, help="Number of days to analyze")
+def cost(days):
+    """Estimate API cost from message sizes."""
+    conn = db.get_connection()
+    rows = db.message_costs(conn, days=days)
+    conn.close()
+
+    if not rows:
+        click.echo("No data in this period.")
+        return
+
+    # Pricing per million tokens (approximate blended rates)
+    PRICING = {
+        "claude": {"input": 3.0, "output": 15.0},
+        "codex": {"input": 2.50, "output": 10.0},
+    }
+
+    by_source = defaultdict(lambda: {"input_chars": 0, "output_chars": 0})
+    by_project = defaultdict(lambda: {"input_chars": 0, "output_chars": 0})
+    by_day = defaultdict(lambda: {"input_chars": 0, "output_chars": 0})
+
+    for r in rows:
+        chars = r["chars"] or 0
+        key = "input_chars" if r["role"] == "user" else "output_chars"
+        by_source[r["source"]][key] += chars
+        by_project[r["project"]][key] += chars
+        by_day[r["day"]][key] += chars
+
+    def estimate_cost(source, input_chars, output_chars):
+        pricing = PRICING.get(source, PRICING["claude"])
+        input_tokens = input_chars / 4
+        output_tokens = output_chars / 4
+        return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+
+    total_cost = 0.0
+
+    click.secho("By source:", bold=True)
+    for source in sorted(by_source):
+        d = by_source[source]
+        c = estimate_cost(source, d["input_chars"], d["output_chars"])
+        total_cost += c  # don't double count - we'll recalculate total
+        input_tok = d["input_chars"] // 4
+        output_tok = d["output_chars"] // 4
+        click.echo(f"  {source:<10s}  ~{input_tok:>10,} input tok  ~{output_tok:>10,} output tok  ~${c:,.0f}")
+
+    # Recalculate total properly
+    total_cost = 0.0
+    for source, d in by_source.items():
+        total_cost += estimate_cost(source, d["input_chars"], d["output_chars"])
+
+    click.echo()
+    click.secho("By project (top 15):", bold=True)
+    project_costs = []
+    for project, d in by_project.items():
+        # Use blended source pricing - approximate with claude rates
+        c = estimate_cost("claude", d["input_chars"], d["output_chars"])
+        project_costs.append((project, c))
+    project_costs.sort(key=lambda x: x[1], reverse=True)
+    for project, c in project_costs[:15]:
+        if c < 0.5:
+            continue
+        click.echo(f"  {project:<30s}  ~${c:,.0f}")
+
+    click.echo()
+    click.echo(f"Estimated total: ~${total_cost:,.0f} over {days} days")
+    click.secho("(Approximate: assumes chars/4 ≈ tokens, blended model pricing)", fg="yellow")
+
+
+@cli.command()
+@click.option("--days", default=30, help="Number of days to analyze")
+@click.option("--project", default=None, help="Filter by project")
+@click.option("--top", default=30, help="Number of topics to show")
+def topics(days, project, top):
+    """Extract topics from recent conversations."""
+    conn = db.get_connection()
+    convs = db.conversation_texts(conn, days=days, project=project)
+    conn.close()
+
+    if not convs:
+        click.echo("No conversations in this period.")
+        return
+
+    from llm_archive.topics import extract_topics
+    results = extract_topics(convs, top_n=top)
+
+    if not results:
+        click.echo("No topics extracted.")
+        return
+
+    click.secho(f"Top {len(results)} topics ({days} days):\n", bold=True)
+    for t in results:
+        projects = ", ".join(t["projects"][:5])
+        count_str = click.style(f"{t['count']}x", fg="yellow")
+        click.echo(f"  {t['topic']:<25s} {count_str}  [{projects}]")
+
+
+@cli.command()
 def stats():
     """Show ingestion statistics."""
     conn = db.get_connection()

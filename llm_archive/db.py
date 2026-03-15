@@ -237,6 +237,67 @@ def summarize_text(conn: sqlite3.Connection, days: int = 7) -> str:
     return "\n".join(parts)
 
 
+def export_conversations(conn: sqlite3.Connection, days: int = 30, project: str | None = None, source: str | None = None) -> list[dict]:
+    sql = """
+        SELECT c.id, c.session_id, c.source, c.project, c.git_branch, c.started_at
+        FROM conversations c
+        WHERE c.started_at >= date('now', ?)
+    """
+    params: list = [f"-{days} days"]
+    if project:
+        sql += " AND c.project = ?"
+        params.append(project)
+    if source:
+        sql += " AND c.source = ?"
+        params.append(source)
+    sql += " ORDER BY c.started_at"
+
+    convs = conn.execute(sql, params).fetchall()
+    results = []
+    for c in convs:
+        msgs = conn.execute(
+            "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp",
+            (c["id"],)
+        ).fetchall()
+        results.append({
+            "session_id": c["session_id"],
+            "source": c["source"],
+            "project": c["project"],
+            "git_branch": c["git_branch"],
+            "started_at": c["started_at"],
+            "messages": [dict(m) for m in msgs],
+        })
+    return results
+
+
+def message_costs(conn: sqlite3.Connection, days: int = 30) -> list[dict]:
+    sql = """
+        SELECT c.source, c.project, m.role, length(m.content) as chars,
+               date(m.timestamp) as day
+        FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        WHERE m.timestamp >= date('now', ?)
+    """
+    rows = conn.execute(sql, [f"-{days} days"]).fetchall()
+    return [dict(r) for r in rows]
+
+
+def conversation_texts(conn: sqlite3.Connection, days: int = 30, project: str | None = None) -> list[dict]:
+    sql = """
+        SELECT c.id, c.project, group_concat(m.content, ' ') as text
+        FROM conversations c
+        JOIN messages m ON m.conversation_id = c.id
+        WHERE c.started_at >= date('now', ?)
+    """
+    params: list = [f"-{days} days"]
+    if project:
+        sql += " AND c.project = ?"
+        params.append(project)
+    sql += " GROUP BY c.id"
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
 def user_messages(conn: sqlite3.Connection, days: int = 30) -> list[dict]:
     sql = """
         SELECT m.content, c.project, m.timestamp
