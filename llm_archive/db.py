@@ -122,3 +122,30 @@ def stats(conn: sqlite3.Connection) -> dict:
         "by_source": [dict(r) for r in by_source],
         "by_project": [dict(r) for r in by_project],
     }
+
+
+def timeline(
+    conn: sqlite3.Connection,
+    days: int = 14,
+    project: str | None = None,
+) -> list[dict]:
+    sql = """
+        SELECT date(c.started_at) as day,
+               c.source,
+               c.project,
+               COUNT(DISTINCT c.id) as convs,
+               COUNT(m.id) as msgs
+        FROM conversations c
+        JOIN messages m ON m.conversation_id = c.id
+        WHERE c.started_at >= date('now', ?)
+    """
+    params: list = [f"-{days} days"]
+
+    if project:
+        sql += " AND c.project = ?"
+        params.append(project)
+
+    sql += " GROUP BY day, c.source, c.project ORDER BY day DESC, convs DESC"
+
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]

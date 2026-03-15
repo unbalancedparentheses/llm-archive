@@ -42,6 +42,29 @@ def search(query, project, source, limit):
 
 
 @cli.command()
+@click.option("--days", default=14, help="Number of days to show")
+@click.option("--project", default=None, help="Filter by project name")
+def timeline(days, project):
+    """Show which projects you worked on each day."""
+    conn = db.get_connection()
+    rows = db.timeline(conn, days=days, project=project)
+    conn.close()
+
+    if not rows:
+        click.echo("No conversations in this period.")
+        return
+
+    current_day = None
+    for r in rows:
+        if r["day"] != current_day:
+            current_day = r["day"]
+            click.echo()
+            click.secho(current_day, fg="green", bold=True)
+        source_tag = click.style(f"[{r['source']}]", fg="cyan")
+        click.echo(f"  {source_tag} {r['project']}: {r['convs']} convs, {r['msgs']} msgs")
+
+
+@cli.command()
 def stats():
     """Show ingestion statistics."""
     conn = db.get_connection()
