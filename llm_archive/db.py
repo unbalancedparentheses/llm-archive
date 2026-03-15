@@ -149,3 +149,44 @@ def timeline(
 
     rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
+
+
+def daily_detail(
+    conn: sqlite3.Connection,
+    days: int = 7,
+    project: str | None = None,
+) -> list[dict]:
+    sql = """
+        SELECT date(c.started_at) as day,
+               time(c.started_at) as time,
+               c.source,
+               c.project,
+               c.session_id,
+               COUNT(m.id) as msgs,
+               MIN(m.timestamp) as first_msg,
+               MAX(m.timestamp) as last_msg
+        FROM conversations c
+        JOIN messages m ON m.conversation_id = c.id
+        WHERE c.started_at >= date('now', ?)
+    """
+    params: list = [f"-{days} days"]
+
+    if project:
+        sql += " AND c.project = ?"
+        params.append(project)
+
+    sql += " GROUP BY c.id ORDER BY c.started_at DESC"
+
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def message_timestamps(conn: sqlite3.Connection, days: int = 30) -> list[tuple[str, str]]:
+    sql = """
+        SELECT date(m.timestamp) as day, m.timestamp
+        FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        WHERE m.timestamp != '' AND m.timestamp >= date('now', ?)
+        ORDER BY m.timestamp
+    """
+    return conn.execute(sql, [f"-{days} days"]).fetchall()

@@ -1,7 +1,12 @@
+from collections import defaultdict
+from datetime import datetime, timedelta
+
 import click
 
 from llm_archive import db
 from llm_archive.ingest import run_ingest
+
+MAX_GAP = timedelta(minutes=30)
 
 
 @click.group()
@@ -62,6 +67,47 @@ def timeline(days, project):
             click.secho(current_day, fg="green", bold=True)
         source_tag = click.style(f"[{r['source']}]", fg="cyan")
         click.echo(f"  {source_tag} {r['project']}: {r['convs']} convs, {r['msgs']} msgs")
+
+
+@cli.command()
+@click.option("--days", default=30, help="Number of days to show")
+def hours(days):
+    """Show active LLM usage hours per day."""
+    conn = db.get_connection()
+    rows = db.message_timestamps(conn, days=days)
+    conn.close()
+
+    by_day = defaultdict(list)
+    for day, ts in rows:
+        try:
+            t = datetime.fromisoformat(ts[:19].replace("T", " "))
+            by_day[day].append(t)
+        except ValueError:
+            continue
+
+    if not by_day:
+        click.echo("No data in this period.")
+        return
+
+    total_hours = 0.0
+    for day in sorted(by_day.keys(), reverse=True):
+        timestamps = sorted(by_day[day])
+        active = timedelta()
+        for i in range(1, len(timestamps)):
+            gap = timestamps[i] - timestamps[i - 1]
+            if gap <= MAX_GAP:
+                active += gap
+
+        h = active.total_seconds() / 3600
+        total_hours += h
+        first = timestamps[0].strftime("%H:%M")
+        last = timestamps[-1].strftime("%H:%M")
+        bar = click.style("█" * int(h), fg="green")
+        click.echo(f"{day}  {first}–{last} UTC  {h:5.1f}h  {len(timestamps):5d} msgs  {bar}")
+
+    avg = total_hours / len(by_day)
+    click.echo()
+    click.echo(f"Total: {total_hours:.0f}h over {len(by_day)} days, avg {avg:.1f}h/day")
 
 
 @cli.command()
