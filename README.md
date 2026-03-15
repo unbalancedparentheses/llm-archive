@@ -9,22 +9,41 @@ A local tool to ingest, search, and analyze conversations from LLM coding assist
 
 Adding new sources (e.g., ChatGPT export JSON) is just another parser module.
 
-## Data formats
+## Install
 
-### Claude Code
+```bash
+pip install -e .
+llm-archive ingest
+```
 
-- Location: `~/.claude/projects/<project>/<session>.jsonl`
-- Top-level `type: "user"` / `type: "assistant"`
-- Content in `message.content` — array of `{type: "text", text: "..."}` or `{type: "tool_use", ...}`
-- Metadata: `cwd`, `gitBranch`, `timestamp`, `sessionId`
+## CLI usage
 
-### Codex CLI
+```bash
+# Ingest new conversations (incremental, safe to re-run)
+llm-archive ingest
 
-- Location: `~/.codex/sessions/YYYY/MM/DD/<session>.jsonl`
-- `type: "response_item"` with `payload.role: "user"` / `"assistant"`
-- Content in `payload.content` — array of `{type: "output_text", text: "..."}` or `{type: "input_text", ...}`
-- Has `payload.phase: "commentary"` vs `"final"`
-- User prompt index at `~/.codex/history.jsonl`
+# Full-text search
+llm-archive search "trusted boundary report"
+llm-archive search "how did we handle auth" --project holdco --source claude
+
+# Drill into a specific day
+llm-archive day 2026-03-12
+
+# Daily project breakdown
+llm-archive timeline --days 30
+
+# Active usage hours per day
+llm-archive hours --days 30
+
+# Weekly summary via Claude API (needs ANTHROPIC_API_KEY)
+llm-archive summarize --days 7
+
+# Find questions you keep asking
+llm-archive recurring --days 30
+
+# Overview counts
+llm-archive stats
+```
 
 ## Architecture
 
@@ -42,41 +61,8 @@ Adding new sources (e.g., ChatGPT export JSON) is just another parser module.
                                    messages(id, conv_id, role, content, timestamp)
                                            │
                                            ▼
-                                   [search]  [summarize]
+                              [search] [timeline] [hours] [summarize] [recurring]
 ```
-
-One ingester per source, one shared schema. Each source gets a parser module that normalizes into the same `(role, text, timestamp, metadata)` tuples.
-
-## Schema
-
-```sql
-CREATE TABLE conversations (
-    id INTEGER PRIMARY KEY,
-    session_id TEXT UNIQUE,
-    source TEXT,          -- "claude" or "codex"
-    project TEXT,         -- extracted from directory path
-    git_branch TEXT,
-    started_at TEXT
-);
-
-CREATE TABLE messages (
-    id INTEGER PRIMARY KEY,
-    conversation_id INTEGER REFERENCES conversations(id),
-    role TEXT,            -- "user" or "assistant"
-    content TEXT,         -- natural language only, code stripped
-    timestamp TEXT
-);
-
-CREATE VIRTUAL TABLE messages_fts USING fts5(content, content=messages, content_rowid=id);
-```
-
-## Stripping rules
-
-- Remove fenced code blocks (``` ... ```)
-- Remove tool_use / tool_result messages entirely
-- Remove thinking blocks
-- Remove system prompts and developer messages
-- Keep: user questions, assistant explanations, commentary, final answers
 
 ## Project structure
 
@@ -84,48 +70,47 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(content, content=messages, content_
 llm-archive/
 ├── llm_archive/
 │   ├── __init__.py
-│   ├── cli.py           # click CLI: ingest, search, summarize
-│   ├── db.py            # SQLite setup + FTS5
-│   ├── strip.py         # remove code blocks, tool calls
-│   ├── parsers/
-│   │   ├── claude.py    # Claude Code JSONL parser
-│   │   └── codex.py     # Codex JSONL parser
-│   └── summarize.py     # Claude API weekly digest
+│   ├── cli.py           # click CLI
+│   ├── db.py            # SQLite + FTS5
+│   ├── ingest.py        # wires parsers to db
+│   ├── strip.py         # remove code blocks
+│   ├── recurring.py     # trigram similarity clustering
+│   ├── summarize.py     # Claude API digest
+│   └── parsers/
+│       ├── __init__.py  # shared types + normalize_project
+│       ├── claude.py    # Claude Code JSONL parser
+│       └── codex.py     # Codex CLI JSONL parser
 └── pyproject.toml
 ```
 
-## CLI usage (planned)
+## Stripping rules
 
-```bash
-# Ingest new conversations (run daily via cron or launchd)
-llm-archive ingest
+- Remove fenced code blocks
+- Remove tool_use / tool_result messages
+- Remove thinking blocks
+- Remove system prompts and developer messages
+- Keep inline code references
+- Keep user questions, assistant explanations, commentary
 
-# Search
-llm-archive search "trusted boundary report"
-llm-archive search "how did we handle auth" --project holdco
+## Changelog
 
-# Semantic search (v2, with embeddings)
-llm-archive similar "memory layout padding alignment"
+### v0.1.0
 
-# Weekly summary
-llm-archive summarize --week
-llm-archive summarize --month
-
-# Topics
-llm-archive topics --week
-```
-
-## Analysis goals
-
-- **What you ask most often** — recurring questions reveal knowledge gaps or tooling friction
-- **Which answers you reject/correct** — tracks where LLMs fail you, so you can adjust prompts
-- **Topic clusters over time** — what you're actually spending time on vs. what you think you are
-- **Prompt patterns that get good answers** — reverse-engineer your most effective prompting style
-- **Knowledge evolution** — what you asked about 3 months ago vs. now shows learning trajectory
+- Parsers for Claude Code and Codex CLI JSONL formats
+- Incremental ingestion into SQLite with FTS5 full-text search
+- Project name normalization across sources (dots, underscores, hyphens unified)
+- `ingest` — parse and store new conversations
+- `search` — full-text search with `--project` and `--source` filters
+- `stats` — overview counts by source and project
+- `timeline` — daily project breakdown with conversation/message counts
+- `hours` — active usage hours per day (30-min gap threshold, visual bars)
+- `day` — drill into a specific date, shows each conversation with timestamp and first user message
+- `summarize` — weekly/monthly digest via Claude API
+- `recurring` — finds repeated questions using trigram similarity, filters system noise
 
 ## Roadmap
 
-- [ ] v0.1 — Ingester + SQLite with FTS5 + keyword search CLI
-- [ ] v0.2 — Claude API weekly/monthly summaries
-- [ ] v0.3 — Local embeddings (sentence-transformers) + semantic search via sqlite-vss
-- [ ] v0.4 — Topic clustering + trends over time
+- [x] v0.1 — Ingestion + FTS5 search + timeline + hours + day drill-down + recurring detection + Claude API summaries
+- [ ] v0.2 — Automatic daily ingestion (launchd), summary output to Obsidian or markdown files
+- [ ] v0.3 — Stats and patterns: time-per-project, Claude vs Codex usage split, topic extraction
+- [ ] v0.4 — Local embeddings (sentence-transformers) + semantic search + cross-project connections
