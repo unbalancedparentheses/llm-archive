@@ -45,6 +45,16 @@ llm-archive projects --by-source
 # Also saves to ~/.local/share/llm-archive/summaries/
 llm-archive summarize --days 7
 
+# Extract topics from conversations (TF-IDF)
+llm-archive topics --days 30
+
+# API cost from actual token usage in JSONL files
+llm-archive cost --days 30
+
+# Export conversations to markdown or JSON
+llm-archive export --days 7 --format md
+llm-archive export --project holdco --format json --output ./backup
+
 # Find questions you keep asking
 llm-archive recurring --days 30
 
@@ -68,7 +78,8 @@ llm-archive stats
                                    messages(id, conv_id, role, content, timestamp)
                                            │
                                            ▼
-                              [search] [timeline] [hours] [summarize] [recurring]
+                              [search] [timeline] [hours] [projects] [cost]
+                              [summarize] [recurring] [topics] [export]
 ```
 
 ## Project structure
@@ -83,6 +94,8 @@ llm-archive/
 │   ├── strip.py         # remove code blocks
 │   ├── recurring.py     # trigram similarity clustering
 │   ├── summarize.py     # Claude API digest
+│   ├── topics.py        # TF-IDF keyword extraction
+│   ├── cost.py          # actual token usage from JSONL
 │   └── parsers/
 │       ├── __init__.py  # shared types + normalize_project
 │       ├── claude.py    # Claude Code JSONL parser
@@ -100,6 +113,12 @@ llm-archive/
 - Keep user questions, assistant explanations, commentary
 
 ## Changelog
+
+### v0.3.0
+
+- `topics` — TF-IDF keyword extraction across conversations, shows dominant themes per project
+- `cost` — actual API cost from token usage in raw JSONL files (cache-aware pricing for Claude and Codex)
+- `export` — dump conversations to markdown or JSON files with `--project`, `--source`, `--format` filters
 
 ### v0.2.0
 
@@ -127,5 +146,5 @@ llm-archive/
 
 - [x] v0.1 — Ingestion + FTS5 search + timeline + hours + day drill-down + recurring detection + Claude API summaries
 - [x] v0.2 — Auto-ingest, summary to markdown, per-project hours, Claude vs Codex split
-- [ ] v0.3 — Topic extraction, conversation export, cost estimation
+- [x] v0.3 — Topic extraction, conversation export, actual token cost tracking
 - [ ] v0.4 — Local embeddings (sentence-transformers) + semantic search + cross-project connections
