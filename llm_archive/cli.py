@@ -155,6 +155,50 @@ def hours(days):
 
 
 @cli.command()
+@click.option("--days", default=30, help="Number of days to analyze")
+def projects(days):
+    """Show active hours per project."""
+    conn = db.get_connection()
+    rows = db.project_timestamps(conn, days=days)
+    conn.close()
+
+    by_project = defaultdict(list)
+    for project, day, ts in rows:
+        try:
+            t = datetime.fromisoformat(ts[:19].replace("T", " "))
+            by_project[project].append(t)
+        except ValueError:
+            continue
+
+    if not by_project:
+        click.echo("No data in this period.")
+        return
+
+    project_hours = {}
+    for project, timestamps in by_project.items():
+        timestamps.sort()
+        active = timedelta()
+        for i in range(1, len(timestamps)):
+            gap = timestamps[i] - timestamps[i - 1]
+            if gap <= MAX_GAP:
+                active += gap
+        project_hours[project] = active.total_seconds() / 3600
+
+    ranked = sorted(project_hours.items(), key=lambda x: x[1], reverse=True)
+    total = sum(h for _, h in ranked)
+
+    for project, h in ranked:
+        if h < 0.1:
+            continue
+        pct = (h / total * 100) if total > 0 else 0
+        bar = click.style("█" * int(h), fg="green")
+        click.echo(f"  {project:<30s} {h:5.1f}h  {pct:4.0f}%  {bar}")
+
+    click.echo()
+    click.echo(f"Total: {total:.0f}h across {len(ranked)} projects ({days} days)")
+
+
+@cli.command()
 @click.argument("date")
 def day(date):
     """Drill into a specific day. Usage: llm-archive day 2026-03-12"""
@@ -194,6 +238,14 @@ def summarize(days):
     summary = weekly_summary(text, days=days)
     click.echo()
     click.echo(summary)
+
+    # Save to markdown file
+    summaries_dir = Path.home() / ".local" / "share" / "llm-archive" / "summaries"
+    summaries_dir.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    md_path = summaries_dir / f"{today}.md"
+    md_path.write_text(f"# LLM Summary — {today} (last {days} days)\n\n{summary}\n")
+    click.secho(f"\nSaved to {md_path}", fg="green")
 
 
 @cli.command()
