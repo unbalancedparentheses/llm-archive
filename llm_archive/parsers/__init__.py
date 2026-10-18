@@ -23,6 +23,14 @@ class ParsedMessage:
 
 
 @dataclass
+class ParsedEvent:
+    event_id: str
+    kind: str
+    content: str
+    timestamp: str
+
+
+@dataclass
 class ParsedConversation:
     session_id: str
     source: str
@@ -30,3 +38,7 @@ class ParsedConversation:
     git_branch: str | None
     started_at: str | None
     messages: list[ParsedMessage] = field(default_factory=list)
+    cwd: str = ""
+    source_path: str = ""
+    is_subagent: bool = False
+    events: list[ParsedEvent] = field(default_factory=list)

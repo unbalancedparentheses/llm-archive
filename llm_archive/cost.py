@@ -6,7 +6,7 @@ from pathlib import Path
 from llm_archive.parsers import normalize_project
 from llm_archive.parsers.claude import CLAUDE_BASE, _extract_project
 
-CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
+from llm_archive.parsers.codex import CODEX_SESSIONS
 
 # Pricing per million tokens
 # Claude: blended across Sonnet/Opus, including cache writes/reads

@@ -1,9 +1,11 @@
 import sqlite3
-from pathlib import Path
+from datetime import datetime, timezone
 
 from llm_archive.parsers import ParsedConversation
+from llm_archive.paths import data_dir, machine_name, device_id
+from llm_archive.projects import repository
 
-DB_DIR = Path.home() / ".local" / "share" / "llm-archive"
+DB_DIR = data_dir()
 DB_PATH = DB_DIR / "archive.db"
 
 _SCHEMA = """
@@ -24,6 +26,8 @@ CREATE TABLE IF NOT EXISTS messages (
     timestamp TEXT
 );
 
+CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
     content=messages,
@@ -38,17 +42,98 @@ CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content)
     VALUES ('delete', old.id, old.content);
 END;
+
+CREATE TABLE IF NOT EXISTS source_files (
+    path TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collector_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS events (
+    conversation_id INTEGER REFERENCES conversations(id),
+    event_id TEXT,
+    kind TEXT,
+    content TEXT,
+    timestamp TEXT,
+    PRIMARY KEY (conversation_id, event_id)
+);
 """
 
 
 def get_connection() -> sqlite3.Connection:
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)
     conn.row_factory = sqlite3.Row
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(conversations)")}
+    for name, declaration in {
+        "cwd": "TEXT", "repo_root": "TEXT", "project_key": "TEXT", "repo_url": "TEXT",
+        "machine": "TEXT", "source_path": "TEXT", "last_activity": "TEXT",
+        "collected_at": "TEXT", "is_subagent": "INTEGER DEFAULT 0", "origin_device": "TEXT",
+    }.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE conversations ADD COLUMN {name} {declaration}")
+    conn.commit()
     return conn
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def set_state(conn, key: str, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO collector_state VALUES (?, ?)", (key, value))
+
+
+def get_state(conn) -> dict:
+    return dict(conn.execute("SELECT key, value FROM collector_state"))
+
+
+def upsert_conversation(conn, conv: ParsedConversation, metadata: dict | None = None) -> tuple[bool, int]:
+    """Refresh growing transcripts, preserving IDs for unchanged messages/embeddings."""
+    info = metadata if metadata is not None else {
+        **repository(conv.cwd), "machine": machine_name(), "source_path": conv.source_path,
+        "collected_at": utc_now(), "is_subagent": int(conv.is_subagent), "origin_device": device_id(),
+    }
+    activity = max([m.timestamp for m in conv.messages] + [e.timestamp for e in conv.events] + [conv.started_at or ""])
+    columns = ["source", "project", "git_branch", "started_at", "cwd", "repo_root", "project_key",
+               "repo_url", "machine", "source_path", "last_activity", "collected_at", "is_subagent", "origin_device"]
+    project = info.get("project") or conv.project
+    if not conv.cwd and metadata is None:
+        project = conv.project
+    values = [conv.source, project, conv.git_branch, conv.started_at,
+              info.get("cwd", conv.cwd), info.get("repo_root", ""), info.get("project_key", ""),
+              info.get("repo_url", ""), info.get("machine", ""), info.get("source_path", ""), activity,
+              info.get("collected_at", utc_now()), int(info.get("is_subagent", conv.is_subagent)), info.get("origin_device", "")]
+    existing = conn.execute("SELECT id FROM conversations WHERE session_id = ?", (conv.session_id,)).fetchone()
+    if existing:
+        conv_id = existing[0]
+        conn.execute("UPDATE conversations SET " + ", ".join(f"{c} = ?" for c in columns) + " WHERE id = ?",
+                     [*values, conv_id])
+    else:
+        cur = conn.execute("INSERT INTO conversations (session_id, " + ", ".join(columns) + ") VALUES (" +
+                           ",".join("?" for _ in range(len(values) + 1)) + ")", [conv.session_id, *values])
+        conv_id = cur.lastrowid
+    old = conn.execute("SELECT id, role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id", (conv_id,)).fetchall()
+    prefix = 0
+    for row, msg in zip(old, conv.messages):
+        if tuple(row)[1:] != (msg.role, msg.content, msg.timestamp):
+            break
+        prefix += 1
+    # Never recycle an ID whose semantic embedding may already exist on disk.
+    max_id = conn.execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0]
+    watermark = conn.execute("SELECT value FROM collector_state WHERE key = 'message_id_watermark'").fetchone()
+    next_id = max(max_id, int(watermark[0]) if watermark else 0) + 1
+    conn.executemany("DELETE FROM messages WHERE id = ?", [(r[0],) for r in old[prefix:]])
+    conn.executemany("INSERT INTO messages (id, conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+                     [(next_id + i, conv_id, m.role, m.content, m.timestamp) for i, m in enumerate(conv.messages[prefix:])])
+    set_state(conn, "message_id_watermark", str(max(next_id - 1, next_id + len(conv.messages) - prefix - 1)))
+    conn.execute("DELETE FROM events WHERE conversation_id = ?", (conv_id,))
+    conn.executemany("INSERT OR REPLACE INTO events VALUES (?, ?, ?, ?, ?)",
+                     [(conv_id, e.event_id, e.kind, e.content, e.timestamp) for e in conv.events])
+    return existing is None, len(conv.messages) - prefix
 
 
 def session_exists(conn: sqlite3.Connection, session_id: str) -> bool:

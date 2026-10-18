@@ -1,6 +1,9 @@
 import os
 import platform
 import subprocess
+import sys
+import json
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -14,6 +17,8 @@ MAX_GAP = timedelta(minutes=30)
 
 
 def _check_scheduler():
+    if not sys.stdout.isatty():
+        return
     system = platform.system()
     if system == "Darwin":
         result = subprocess.run(
@@ -39,7 +44,7 @@ def _check_scheduler():
             else:
                 click.secho("auto-ingest: not installed (run: llm-archive install-cron)", fg="yellow")
 
-    db_path = Path.home() / ".local" / "share" / "llm-archive" / "archive.db"
+    db_path = db.DB_PATH
     if db_path.exists():
         mtime = datetime.fromtimestamp(db_path.stat().st_mtime)
         age = datetime.now() - mtime
@@ -59,10 +64,14 @@ def cli():
 
 
 @cli.command()
-def ingest():
+@click.option("--force", is_flag=True, help="Reparse all files, including unchanged ones")
+def ingest(force):
     """Ingest conversations from Claude Code and Codex CLI."""
-    new_convs, new_msgs = run_ingest()
-    click.echo(f"Ingested {new_convs} conversations ({new_msgs} messages)")
+    try:
+        new_convs, new_msgs = run_ingest(force=force)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Updated {new_convs} conversations ({new_msgs} new or refreshed messages)")
 
 
 @cli.command()
@@ -342,7 +351,7 @@ def summarize(days):
     click.echo(summary)
 
     # Save to markdown file
-    summaries_dir = Path.home() / ".local" / "share" / "llm-archive" / "summaries"
+    summaries_dir = db.DB_DIR / "summaries"
     summaries_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     md_path = summaries_dir / f"{today}.md"
@@ -378,7 +387,7 @@ def ideas(days, project):
     click.echo(result)
 
     # Save to file
-    ideas_dir = Path.home() / ".local" / "share" / "llm-archive" / "ideas"
+    ideas_dir = db.DB_DIR / "ideas"
     ideas_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     md_path = ideas_dir / f"{today}.md"
@@ -417,16 +426,19 @@ def recurring(days, threshold, min_count):
 
 
 @cli.command(name="install-cron")
-def install_cron():
-    """Set up daily automatic ingestion (launchd/systemd/crontab)."""
+@click.option("--interval", default=120, type=click.IntRange(min=60), show_default=True, help="Seconds between checkpoints")
+def install_cron(interval):
+    """Install periodic capture, handoffs, and configured sync (also: install-service)."""
     from llm_archive.scheduler import install
-    result = install()
-    click.echo(result)
+    try:
+        click.echo(install(interval=interval))
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @cli.command(name="uninstall-cron")
 def uninstall_cron():
-    """Remove daily automatic ingestion."""
+    """Remove automatic checkpoints (also: uninstall-service)."""
     from llm_archive.scheduler import uninstall
     result = uninstall()
     click.echo(result)
@@ -564,3 +576,154 @@ def stats():
     click.echo("\nTop projects:")
     for row in s["by_project"]:
         click.echo(f"  {row['project']}: {row['convs']} conversations")
+
+
+@cli.command()
+@click.option("--no-sync", is_flag=True, help="Capture locally without contacting the configured sync remote")
+def checkpoint(no_sync):
+    """Capture changed sessions, write handoffs, and sync if configured."""
+    from llm_archive.journal import checkpoint as capture
+    try:
+        updated, messages, projects = capture(sync=not no_sync)
+    except (RuntimeError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"{db.utc_now()}: checked sessions; updated {updated} conversations, {messages} messages, {projects} project handoffs.")
+
+
+@cli.command()
+@click.option("--interval", default=120, type=click.IntRange(min=60), show_default=True)
+def watch(interval):
+    """Run checkpoints in the foreground until Ctrl-C."""
+    from llm_archive.journal import checkpoint as capture
+    try:
+        while True:
+            try:
+                updated, messages, projects = capture()
+                click.echo(f"{db.utc_now()}: {updated} sessions updated; {projects} project handoffs.")
+            except (OSError, RuntimeError, ValueError) as exc:
+                click.echo(f"{db.utc_now()}: {exc}", err=True)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+
+
+@cli.command()
+@click.option("--days", default=7, type=click.IntRange(min=1), show_default=True)
+@click.option("--project", default=None, help="Project name or repository identity")
+@click.option("--limit", default=20, type=click.IntRange(min=1), show_default=True)
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable status and recent sessions")
+def status(days, project, limit, as_json):
+    """See capture/sync health and recent work across projects and computers."""
+    from llm_archive.journal import recent_sessions
+    from llm_archive.paths import read_config
+    conn = db.get_connection()
+    try:
+        state = db.get_state(conn)
+        sessions = recent_sessions(conn, days=days, project=project, limit=limit)
+    finally:
+        conn.close()
+    if as_json:
+        click.echo(json.dumps({"collector": state, "sync_configured": bool(read_config().get("sync_directory")), "sessions": sessions}, indent=2))
+        return
+    click.echo(f"Last check:      {state.get('last_check', 'never')}")
+    click.echo(f"Last successful: {state.get('last_success', 'never')}")
+    click.echo(f"Last sync:       {state.get('last_sync', 'never') if read_config().get('sync_directory') else 'not configured'}")
+    for key in ("capture_error", "sync_error"):
+        if state.get(key):
+            click.secho(f"{key}: {state[key]}", fg="yellow")
+    click.echo()
+    for s in sessions:
+        click.echo(f"{s['last_activity'] or s['started_at']}  {s['project']}  [{s['source']}]  {s.get('git_branch') or ''}")
+        click.echo(f"  {s.get('machine') or 'unknown computer'}: {s.get('cwd') or 'directory not recorded'}")
+    if not sessions:
+        click.echo("No recent sessions. Run llm-archive checkpoint to capture existing history.")
+
+
+@cli.command()
+@click.argument("project")
+@click.option("--days", default=30, type=click.IntRange(min=1), show_default=True)
+@click.option("--session", "session_id", default=None, help="Limit the handoff to a session ID")
+@click.option("--output", type=click.Path(path_type=Path), help="Write a portable Markdown handoff")
+def resume(project, days, session_id, output):
+    """Print the latest context and continuation commands for PROJECT."""
+    from llm_archive.journal import handoff, recent_sessions
+    from llm_archive.paths import atomic_write
+    conn = db.get_connection()
+    try:
+        sessions = recent_sessions(conn, days=days, project=project, limit=10000)
+        if session_id:
+            sessions = [s for s in sessions if s["session_id"] == session_id]
+        if not sessions:
+            raise click.ClickException("No matching activity. Run checkpoint or increase --days.")
+        text = handoff(conn, sessions[:5])
+    finally:
+        conn.close()
+    if output:
+        atomic_write(output, text)
+        click.echo(f"Saved handoff to {output}")
+    else:
+        click.echo(text)
+
+
+@cli.command()
+@click.option("--days", default=3, type=click.IntRange(min=1), show_default=True)
+@click.option("--project", default=None, help="Only reopen this project")
+@click.option("--limit", default=10, type=click.IntRange(min=1), show_default=True, help="Maximum directories to reopen")
+@click.option("--resume", "resume_agents", is_flag=True, help="Resume the latest local agent session in each directory")
+@click.option("--projects-root", type=click.Path(exists=True, file_okay=False, path_type=Path), help="Find local checkouts under this directory on another computer")
+@click.option("--dry-run", is_flag=True, help="Preview tabs and commands without opening Ghostty")
+def reopen(days, project, limit, resume_agents, projects_root, dry_run):
+    """Restore recent project/worktree directories as Ghostty tabs (macOS)."""
+    from llm_archive.journal import recent_sessions
+    from llm_archive.terminal import open_ghostty, reopen_plan
+    conn = db.get_connection()
+    try:
+        sessions = recent_sessions(conn, days=days, project=project, limit=10000)
+    finally:
+        conn.close()
+    plan = reopen_plan(sessions, resume=resume_agents, projects_root=projects_root)[:limit]
+    if not plan:
+        click.echo("No recent project directories. Run checkpoint or increase --days.")
+        return
+    for p in plan:
+        click.echo(f"{p['project']}: {p['cwd'] or 'skipped'}")
+        if p["command"]:
+            click.echo(f"  {p['command']}")
+        if p["note"]:
+            click.echo(f"  {p['note']}")
+    if dry_run:
+        return
+    try:
+        click.echo(f"Opened {open_ghostty(plan)} Ghostty tabs.")
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.command(name="sync-init")
+@click.argument("remote")
+def sync_init(remote):
+    """Connect a dedicated private Git repository for journal data."""
+    from llm_archive.sync import configure
+    try:
+        root = configure(remote)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Journal sync configured: {root}\nRun llm-archive sync to exchange records now; checkpoints will sync automatically.")
+
+
+@cli.command()
+def sync():
+    """Exchange journal records with the configured private Git remote."""
+    from llm_archive.sync import sync_if_configured
+    from llm_archive.paths import read_config
+    if not read_config().get("sync_directory"):
+        raise click.ClickException("Sync is not configured. Use: llm-archive sync-init <private-git-url>")
+    try:
+        count = sync_if_configured()
+    except (RuntimeError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Synced journal; imported {count} session updates.")
+
+
+cli.add_command(install_cron, "install-service")
+cli.add_command(uninstall_cron, "uninstall-service")
