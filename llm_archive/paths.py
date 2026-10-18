@@ -33,12 +33,16 @@ def read_config() -> dict:
 
 
 def atomic_write(path: Path, text: str) -> None:
+    atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def atomic_write_bytes(path: Path, content: bytes) -> None:
     import tempfile
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, delete=False) as f:
         temp = Path(f.name)
         try:
-            f.write(text)
+            f.write(content)
             f.flush()
             os.fsync(f.fileno())
             os.replace(temp, path)

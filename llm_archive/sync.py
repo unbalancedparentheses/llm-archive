@@ -4,6 +4,8 @@ SQLite and agent credential/config files are never copied. Network failures leav
 local capture intact; unpushed commits are retried by the next checkpoint.
 """
 import json
+import gzip
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -16,7 +18,7 @@ MARKER = "journal-format.json"
 
 def _git(root: Path, *args: str, check=True):
     result = subprocess.run(["git", "-C", str(root), *args], text=True, capture_output=True,
-                            timeout=45, env=_git_environment())
+                            timeout=180 if args and args[0] == "push" else 45, env=_git_environment())
     if check and result.returncode:
         raise RuntimeError(f"Journal Git {' '.join(args[:2])} failed: {result.stderr.strip()}")
     return result
@@ -49,7 +51,7 @@ def configure(remote: str) -> Path:
     if (root / MARKER).exists():
         _check_format(root)
     else:
-        atomic_write(root / MARKER, json.dumps({"format": "llm-archive-journal", "version": 1}) + "\n")
+        atomic_write(root / MARKER, json.dumps({"format": "llm-archive-journal", "version": 2}) + "\n")
     config = read_config()
     config["sync_directory"] = str(root)
     atomic_write(data_dir() / "config.json", json.dumps(config, indent=2) + "\n")
@@ -58,51 +60,88 @@ def configure(remote: str) -> Path:
 
 def _check_format(root: Path):
     marker = json.loads((root / MARKER).read_text())
-    if marker != {"format": "llm-archive-journal", "version": 1}:
+    if marker.get("format") != "llm-archive-journal" or marker.get("version") not in (1, 2):
         raise RuntimeError("Unsupported journal sync format")
 
 
 def export_device(conn, root: Path) -> Path:
-    records = []
+    from llm_archive.workspaces import export_local
+    folder = root / "devices" / device_id()
+    folder.mkdir(parents=True, exist_ok=True)
+    records_dir = folder / "sessions"
+    records_dir.mkdir(exist_ok=True)
     for row in conn.execute("SELECT * FROM conversations WHERE origin_device = ? ORDER BY session_id", (device_id(),)):
-        record = dict(row)
-        cid = record.pop("id")
-        record["messages"] = [dict(m) for m in conn.execute(
-            "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id", (cid,))]
-        record["events"] = [dict(e) for e in conn.execute(
-            "SELECT event_id, kind, content, timestamp FROM events WHERE conversation_id = ? ORDER BY rowid", (cid,))]
-        records.append(record)
-    path = root / "devices" / device_id() / "sessions.jsonl"
-    text = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in records)
-    if not path.exists() or path.read_text() != text:
-        atomic_write(path, text)
-    return path
+        cid = row["id"]
+        record = db.conversation_record(conn, cid)
+        record["revisions"] = [json.loads(r[0]) for r in conn.execute(
+            "SELECT snapshot FROM conversation_revisions WHERE conversation_id = ? ORDER BY revision_key", (cid,))]
+        # Bound Git object size to one compressed session, not the entire archive.
+        name = hashlib.sha256(record["session_id"].encode()).hexdigest() + ".json.gz"
+        path = records_dir / name
+        encoded = json.dumps(record, ensure_ascii=False, sort_keys=True).encode()
+        compressed = gzip.compress(encoded, mtime=0)
+        if not path.exists() or path.read_bytes() != compressed:
+            from llm_archive.paths import atomic_write_bytes
+            atomic_write_bytes(path, compressed)
+    # The database is authoritative for this generated snapshot. Historical
+    # versions remain in records and previously published Git history.
+    (folder / "sessions.jsonl").unlink(missing_ok=True)
+    atomic_write(root / MARKER, json.dumps({"format": "llm-archive-journal", "version": 2}) + "\n")
+    workspaces_path = folder / "workspaces.json"
+    workspace_text = json.dumps(export_local(), indent=2, sort_keys=True) + "\n"
+    if not workspaces_path.exists() or workspaces_path.read_text() != workspace_text:
+        atomic_write(workspaces_path, workspace_text)
+    return records_dir
+
+
+def _device_records(folder: Path):
+    legacy = folder / "sessions.jsonl"
+    if legacy.exists():
+        with legacy.open(encoding="utf-8") as stream:
+            for line in stream:
+                yield json.loads(line)
+    for path in sorted((folder / "sessions").glob("*.json.gz")):
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            yield json.load(stream)
 
 
 def import_devices(conn, root: Path) -> int:
+    from llm_archive.workspaces import import_foreign
     imported = 0
     own = device_id()
-    for path in sorted((root / "devices").glob("*/sessions.jsonl")):
-        if path.parent.name == own:
+    for folder in sorted((root / "devices").iterdir()):
+        if not folder.is_dir() or folder.name == own:
             continue
-        with path.open(encoding="utf-8") as f:
-            for line in f:
-                try:
-                    record = json.loads(line)
-                    existing = conn.execute("SELECT collected_at FROM conversations WHERE session_id = ?", (record["session_id"],)).fetchone()
-                    if existing and (existing[0] or "") >= record["collected_at"]:
-                        continue
-                    conv = ParsedConversation(
-                        session_id=record["session_id"], source=record["source"], project=record["project"],
-                        git_branch=record.get("git_branch"), started_at=record.get("started_at"),
-                        messages=[ParsedMessage(**m) for m in record["messages"]],
-                        events=[ParsedEvent(**e) for e in record.get("events", [])],
-                        cwd=record.get("cwd", ""), is_subagent=bool(record.get("is_subagent")),
-                    )
-                    db.upsert_conversation(conn, conv, metadata=record)
-                    imported += 1
-                except (ValueError, KeyError, TypeError) as exc:
-                    raise RuntimeError(f"Invalid journal record in {path}: {exc}") from exc
+        workspace_path = folder / "workspaces.json"
+        if workspace_path.exists():
+            import_foreign(folder.name, json.loads(workspace_path.read_text()))
+        for record in _device_records(folder):
+            try:
+                existing = conn.execute("SELECT id, collected_at FROM conversations WHERE session_id = ?", (record["session_id"],)).fetchone()
+                if existing:
+                    for snapshot in record.get("revisions", []):
+                        if snapshot.get("session_id") != record["session_id"]:
+                            raise ValueError("Revision belongs to another session")
+                        db.store_revision(conn, existing["id"], snapshot)
+                if existing and (existing["collected_at"] or "") >= record["collected_at"]:
+                    continue
+                conv = ParsedConversation(
+                    session_id=record["session_id"], source=record["source"], project=record["project"],
+                    git_branch=record.get("git_branch"), started_at=record.get("started_at"),
+                    messages=[ParsedMessage(**m) for m in record["messages"]],
+                    events=[ParsedEvent(**e) for e in record.get("events", [])],
+                    cwd=record.get("cwd", ""), is_subagent=bool(record.get("is_subagent")),
+                )
+                db.upsert_conversation(conn, conv, metadata=record)
+                if not existing:
+                    cid = conn.execute("SELECT id FROM conversations WHERE session_id = ?", (record["session_id"],)).fetchone()[0]
+                    for snapshot in record.get("revisions", []):
+                        if snapshot.get("session_id") != record["session_id"]:
+                            raise ValueError("Revision belongs to another session")
+                        db.store_revision(conn, cid, snapshot)
+                imported += 1
+            except (ValueError, KeyError, TypeError) as exc:
+                raise RuntimeError(f"Invalid journal record in {folder}: {exc}") from exc
     return imported
 
 
@@ -142,7 +181,7 @@ def run_sync(root: Path) -> int:
             from llm_archive.journal import write_handoffs
             write_handoffs(conn)
             return imported
-        except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as exc:
+        except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError, EOFError, KeyError, TypeError) as exc:
             conn.rollback()
             db.set_state(conn, "sync_error", str(exc))
             conn.commit()

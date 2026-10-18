@@ -1,4 +1,6 @@
 import sqlite3
+import hashlib
+import json
 from datetime import datetime, timezone
 
 from llm_archive.parsers import ParsedConversation
@@ -57,6 +59,13 @@ CREATE TABLE IF NOT EXISTS events (
     timestamp TEXT,
     PRIMARY KEY (conversation_id, event_id)
 );
+CREATE TABLE IF NOT EXISTS conversation_revisions (
+    revision_key TEXT PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+    captured_at TEXT NOT NULL,
+    snapshot TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS revisions_conversation_idx ON conversation_revisions(conversation_id, captured_at);
 """
 
 
@@ -91,6 +100,35 @@ def get_state(conn) -> dict:
     return dict(conn.execute("SELECT key, value FROM collector_state"))
 
 
+def conversation_record(conn, conv_id: int) -> dict:
+    record = dict(conn.execute("SELECT * FROM conversations WHERE id = ?", (conv_id,)).fetchone())
+    record.pop("id")
+    record["messages"] = [dict(m) for m in conn.execute(
+        "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id", (conv_id,))]
+    record["events"] = [dict(e) for e in conn.execute(
+        "SELECT event_id, kind, content, timestamp FROM events WHERE conversation_id = ? ORDER BY rowid", (conv_id,))]
+    return record
+
+
+def store_revision(conn, conv_id: int, snapshot: dict) -> str:
+    """Historical payloads are immutable and content-addressed; repeated imports deduplicate."""
+    serialized = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    key = hashlib.sha256(serialized.encode()).hexdigest()
+    conn.execute("INSERT OR IGNORE INTO conversation_revisions VALUES (?, ?, ?, ?)",
+                 (key, conv_id, snapshot.get("collected_at") or utc_now(), serialized))
+    return key
+
+
+def revisions(conn, project: str, session_id: str | None = None) -> list[dict]:
+    sql = """SELECT r.*, c.project, c.source, c.session_id FROM conversation_revisions r
+             JOIN conversations c ON c.id = r.conversation_id WHERE (c.project = ? OR c.project_key = ?)"""
+    args = [project, project]
+    if session_id:
+        sql += " AND c.session_id = ?"
+        args.append(session_id)
+    return [dict(row) for row in conn.execute(sql + " ORDER BY r.captured_at DESC", args)]
+
+
 def upsert_conversation(conn, conv: ParsedConversation, metadata: dict | None = None) -> tuple[bool, int]:
     """Refresh growing transcripts, preserving IDs for unchanged messages/embeddings."""
     info = metadata if metadata is not None else {
@@ -107,9 +145,20 @@ def upsert_conversation(conn, conv: ParsedConversation, metadata: dict | None = 
               info.get("cwd", conv.cwd), info.get("repo_root", ""), info.get("project_key", ""),
               info.get("repo_url", ""), info.get("machine", ""), info.get("source_path", ""), activity,
               info.get("collected_at", utc_now()), int(info.get("is_subagent", conv.is_subagent)), info.get("origin_device", "")]
-    existing = conn.execute("SELECT id FROM conversations WHERE session_id = ?", (conv.session_id,)).fetchone()
+    existing = conn.execute("SELECT * FROM conversations WHERE session_id = ?", (conv.session_id,)).fetchone()
     if existing:
-        conv_id = existing[0]
+        conv_id = existing["id"]
+        before = conversation_record(conn, conv_id)
+        previous_messages = [(m["role"], m["content"], m["timestamp"]) for m in before["messages"]]
+        incoming_messages = [(m.role, m.content, m.timestamp) for m in conv.messages]
+        incoming_events = [dict(event_id=e.event_id, kind=e.kind, content=e.content, timestamp=e.timestamp) for e in conv.events]
+        changed_history = (previous_messages != incoming_messages[:len(previous_messages)] or
+                           before["events"] != incoming_events[:len(before["events"])] or
+                           (before.get("cwd") and before["cwd"] != info.get("cwd", conv.cwd)))
+        if changed_history:
+            store_revision(conn, conv_id, before)
+        # Truncating a source must not make this session disappear from recent activity.
+        values[columns.index("last_activity")] = max(activity, before.get("last_activity") or "")
         conn.execute("UPDATE conversations SET " + ", ".join(f"{c} = ?" for c in columns) + " WHERE id = ?",
                      [*values, conv_id])
     else:

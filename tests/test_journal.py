@@ -18,6 +18,9 @@ from llm_archive.parsers import ParsedConversation, ParsedMessage
 from llm_archive.paths import collector_lock, device_id
 from llm_archive.projects import canonical_remote, repository
 from llm_archive.terminal import ghostty_script, reopen_plan
+from llm_archive.overview import display_time, project_overview
+from llm_archive import workspaces
+from datetime import datetime, timezone
 
 
 def git(root, *args):
@@ -34,6 +37,7 @@ class JournalTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}))
         self.stack.enter_context(self.device("one"))
+        self.stack.enter_context(patch("llm_archive.terminal.ghostty_directories", return_value=set()))
 
     @contextmanager
     def device(self, name):
@@ -161,7 +165,126 @@ class JournalTests(unittest.TestCase):
         self.assertGreater(conn.execute("SELECT max(id) FROM messages").fetchone()[0], old_max)
         self.assertFalse(db.search(conn, "Old"))
         self.assertEqual(len(db.search(conn, "New")), 1)
+        versions = db.revisions(conn, self.sessions()[0]["project"])
+        self.assertTrue(any("Old answer" in r["snapshot"] for r in versions))
         conn.close()
+
+    def test_history_survives_truncation_and_can_be_exported(self):
+        path = self.codex_file()
+        self.message(path, "assistant", "Important original context")
+        ingest.run_ingest()
+        old_time = self.sessions()[0]["last_activity"]
+        path.write_text("".join(path.read_text().splitlines(keepends=True)[:2]))
+        ingest.run_ingest()
+        sessions = self.sessions()
+        self.assertEqual(sessions[0]["last_activity"], old_time)
+        result = CliRunner().invoke(cli, ["history", sessions[0]["project"]])
+        self.assertEqual(result.exit_code, 0, result.output)
+        key = result.output.split()[0]
+        result = CliRunner().invoke(cli, ["history", sessions[0]["project"], "--revision", key])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Important original context", result.output)
+
+    def test_tool_result_rewrites_preserve_original_evidence(self):
+        path = self.codex_file()
+        event = {"type": "response_item", "timestamp": db.utc_now(), "payload": {
+            "type": "function_call_output", "call_id": "one", "output": "original failure"}}
+        self.append(path, event)
+        ingest.run_ingest()
+        text = path.read_text().replace("original failure", "corrected output")
+        path.write_text(text)
+        ingest.run_ingest()
+        conn = db.get_connection()
+        self.assertIn("original failure", db.revisions(conn, self.sessions()[0]["project"])[0]["snapshot"])
+        conn.close()
+
+    def test_compressed_codex_archives_are_streamed_and_deduplicated(self):
+        import zstandard
+        path = self.codex_file()
+        raw = path.read_bytes()
+        archive = Path(os.environ["CODEX_HOME"]) / "archived_sessions/archive.jsonl.zst"
+        archive.parent.mkdir()
+        half = len(raw) // 2
+        compressor = zstandard.ZstdCompressor()
+        archive.write_bytes(compressor.compress(raw[:half]) + compressor.compress(raw[half:]))
+        ingest.run_ingest()
+        self.assertEqual(len(self.sessions()), 1)
+        self.assertEqual(self.sessions()[0]["message_count"], 1)
+        path.unlink()
+        self.assertEqual(ingest.run_ingest(), (0, 0))
+
+    def test_corrupt_compressed_archive_does_not_erase_captured_sessions(self):
+        self.codex_file()
+        bad = Path(os.environ["CODEX_HOME"]) / "sessions/bad.jsonl.zst"
+        bad.write_bytes(b"not a zstandard frame")
+        with self.assertRaisesRegex(RuntimeError, "Checkpoint incomplete"):
+            ingest.run_ingest()
+        self.assertEqual(len(self.sessions()), 1)
+
+    def test_status_groups_sessions_and_reports_recorded_next_step(self):
+        one = self.codex_file()
+        self.message(one, "assistant", "Test fixed. Next step: run integration checks.")
+        two = self.codex_file(name="second")
+        self.message(two, "assistant", "Build complete. Next step: review the diff.")
+        ingest.run_ingest()
+        runner = CliRunner()
+        result = runner.invoke(cli, ["status", "--json"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        record = json.loads(result.output)
+        self.assertEqual(len(record["projects"]), 1)
+        self.assertEqual(record["projects"][0]["session_count"], 2)
+        self.assertIn("review the diff", record["projects"][0]["next_step"])
+        result = runner.invoke(cli, ["status", "--sessions"])
+        self.assertIn("session-one", result.output)
+        self.assertIn("second", result.output)
+
+    def test_times_show_relative_age_and_invalid_timestamps_remain_readable(self):
+        now = datetime(2026, 10, 18, 14, 30, tzinfo=timezone.utc)
+        self.assertIn("3m ago", display_time("2026-10-18T14:27:00Z", now=now))
+        self.assertEqual(display_time(None), "never")
+        self.assertEqual(display_time("unknown"), "unknown")
+
+    def test_generic_followup_does_not_replace_the_actual_task_in_status(self):
+        path = self.codex_file()
+        self.message(path, "user", "fix anything that is needed")
+        self.message(path, "user", "[Earlier usage-limit notes no longer apply. Continue working normally.]")
+        ingest.run_ingest()
+        conn = db.get_connection()
+        overview = project_overview(conn, recent_sessions(conn))
+        conn.close()
+        self.assertEqual(overview[0]["task"], "Fix the failing checkout test")
+
+    def test_workspaces_select_and_restore_a_specific_session(self):
+        self.codex_file()
+        second = self.codex_file(name="selected-session")
+        ingest.run_ingest()
+        record = workspaces.save("daily", self.sessions())
+        self.assertEqual(len(record["sessions"]), 1)
+        result = CliRunner().invoke(cli, ["reopen", "--workspace", "daily", "--dry-run", "--resume"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("selected-session", result.output)
+        result = CliRunner().invoke(cli, ["reopen", "--session", "session-one", "--dry-run", "--resume"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("codex resume session-one", result.output)
+        self.assertNotIn("codex resume selected-session", result.output)
+
+    def test_workspace_from_tabs_preserves_untracked_shell_directories(self):
+        folder = self.root / "shell-only"
+        folder.mkdir()
+        record = workspaces.save("shells", [], directories={str(folder.resolve())})
+        plan = reopen_plan(record["sessions"], resume=True)
+        self.assertEqual(plan[0]["cwd"], str(folder.resolve()))
+        self.assertEqual(plan[0]["command"], "")
+        for name in ("../escape", "/tmp/escape", ".", "other:workspace"):
+            with self.assertRaises(ValueError):
+                workspaces.save(name, self.sessions())
+
+    def test_ghostty_script_skips_existing_directories_unless_explicitly_requested(self):
+        plan = [{"cwd": "/tmp/project", "project": "project", "command": ""}]
+        self.assertIn("repeat with existingTerminal", ghostty_script(plan))
+        self.assertIn("return openedCount", ghostty_script(plan))
+        plan[0]["new_tab"] = True
+        self.assertNotIn("repeat with existingTerminal", ghostty_script(plan))
 
     def test_repo_identity_groups_worktrees_and_removes_remote_credentials(self):
         root = self.root / "repository"
@@ -271,11 +394,13 @@ class JournalTests(unittest.TestCase):
         git(self.root, "init", "--bare", "--initial-branch=main", str(remote))
         local_path = self.codex_file()
         ingest.run_ingest()
+        workspaces.save("daily", self.sessions())
         one = sync.configure(str(remote))
         self.assertEqual(sync.run_sync(one), 0)
         with self.device("two"):
             two = sync.configure(str(remote))
             self.assertEqual(sync.run_sync(two), 1)
+            self.assertEqual(workspaces.load("daily")["sessions"][0]["session_id"], "session-one")
             self.assertEqual(sync.run_sync(two), 0)
             self.assertEqual(len(self.sessions()), 1)
             self.codex_file(name="session-two")
@@ -291,6 +416,61 @@ class JournalTests(unittest.TestCase):
         with self.device("two"):
             self.assertEqual(sync.run_sync(two), 1)
             self.assertEqual(next(s for s in self.sessions() if s["session_id"] == "session-one")["message_count"], 2)
+
+    def test_preserved_versions_sync_without_duplicates_even_when_current_record_is_unchanged(self):
+        remote = self.root / "remote.git"
+        git(self.root, "init", "--bare", "--initial-branch=main", str(remote))
+        path = self.codex_file()
+        self.message(path, "assistant", "Recover this context")
+        ingest.run_ingest()
+        path.write_text("".join(path.read_text().splitlines(keepends=True)[:2]))
+        ingest.run_ingest()
+        root = sync.configure(str(remote))
+        sync.run_sync(root)
+        with self.device("two"):
+            root2 = sync.configure(str(remote))
+            sync.run_sync(root2)
+            conn = db.get_connection()
+            self.assertEqual(conn.execute("SELECT count(*) FROM conversation_revisions").fetchone()[0], 1)
+            self.assertIn("Recover this context", conn.execute("SELECT snapshot FROM conversation_revisions").fetchone()[0])
+            conn.close()
+            sync.run_sync(root2)
+            conn = db.get_connection()
+            self.assertEqual(conn.execute("SELECT count(*) FROM conversation_revisions").fetchone()[0], 1)
+            conn.close()
+
+    def test_sync_uses_compressed_per_session_records(self):
+        import gzip
+        self.codex_file()
+        self.codex_file(name="another-session")
+        ingest.run_ingest()
+        root = self.root / "snapshot"
+        conn = db.get_connection()
+        records = sync.export_device(conn, root)
+        conn.close()
+        paths = list(records.glob("*.json.gz"))
+        self.assertEqual(len(paths), 2)
+        self.assertFalse((records.parent / "sessions.jsonl").exists())
+        with gzip.open(paths[0], "rt") as stream:
+            self.assertIn("messages", json.load(stream))
+        self.assertEqual(json.loads((root / sync.MARKER).read_text())["version"], 2)
+
+    def test_legacy_jsonl_snapshots_are_still_imported(self):
+        self.codex_file()
+        ingest.run_ingest()
+        conn = db.get_connection()
+        record = db.conversation_record(conn, self.sessions()[0]["id"])
+        conn.close()
+        root = self.root / "legacy"
+        folder = root / "devices" / device_id()
+        folder.mkdir(parents=True)
+        (folder / "sessions.jsonl").write_text(json.dumps(record) + "\n")
+        with self.device("two"):
+            conn = db.get_connection()
+            self.assertEqual(sync.import_devices(conn, root), 1)
+            conn.commit()
+            self.assertEqual(len(recent_sessions(conn)), 1)
+            conn.close()
 
     def test_offline_sync_keeps_local_capture_and_reports_failure(self):
         remote = self.root / "remote.git"

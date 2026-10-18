@@ -14,7 +14,7 @@ llm-archive ingest          # parse conversations into SQLite
 llm-archive embed           # build semantic search index (optional, needs ollama)
 llm-archive checkpoint     # capture current work and write project handoffs
 llm-archive install-service # checkpoint every two minutes + on login
-llm-archive status         # recent projects and capture/sync health
+llm-archive status         # grouped projects, task excerpts, and capture/sync health
 llm-archive reopen --dry-run # preview recent project tabs
 ```
 
@@ -30,13 +30,14 @@ Install the service after installing the package. It uses the executable from yo
 
 ## Automatic project journal and recovery
 
-The collector checks for changed session files every **120 seconds**. Sessions already in the archive are refreshed as they grow; unchanged files are skipped. It also reads nested Claude subagent transcripts and uncompressed archived Codex sessions. Repository remotes identify the same project across worktrees and computers; each session keeps its original directory, branch, computer, and transcript location.
+The collector checks for changed session files every **120 seconds**. Sessions already in the archive are refreshed as they grow; unchanged files are skipped. It also reads nested Claude subagent transcripts and plain or Zstandard-compressed (`.jsonl.zst`) Codex sessions and archives. Compressed files are streamed, and a session appearing in both plain and compressed form is deduplicated. Repository remotes identify the same project across worktrees and computers; each session keeps its original directory, branch, computer, and transcript location.
 
 Each checkpoint produces readable Markdown handoffs for projects active in the last seven days. A handoff includes recent requests and assistant updates, compact tool calls/results, and the current local Git branch, HEAD, and changed-file list when available. Search continues to index natural-language messages; tool evidence is stored separately. Handoffs use recorded evidence and run without an LLM or API costs. They do not infer that a task succeeded from an assistant's completion claim.
 
 ```bash
 llm-archive status                       # last check, successful check, sync, recent work
 llm-archive status --project holdco
+llm-archive status --sessions            # individual session IDs, directories, and branches
 llm-archive status --json                # machine-readable output
 llm-archive resume holdco                # latest exchanges and continuation commands
 llm-archive resume holdco --output /tmp/holdco-handoff.md
@@ -44,6 +45,20 @@ llm-archive resume holdco --session SESSION_ID --days 90
 llm-archive checkpoint --no-sync         # immediate local checkpoint
 llm-archive ingest --force               # reparse unchanged files after parser upgrades
 ```
+
+By default, `status` groups sessions under each repository and shows short excerpts of the latest request, assistant update, and a reported next step when present. These are deterministic excerpts, not AI-generated conclusions. Each project summary refers to its most recently active session; `--sessions` exposes parallel tasks. Times are displayed in the computer's local timezone with a relative age; JSON retains the original timestamps.
+
+### Preserve earlier transcript versions
+
+If an agent rewrites or truncates a transcript, the current searchable view is updated while the previous captured messages, tool evidence, and session metadata are retained as an immutable version. Historical versions are included in private sync. Normal appends preserve existing message IDs and do not create redundant whole-conversation versions.
+
+```bash
+llm-archive history holdco
+llm-archive history holdco --session SESSION_ID
+llm-archive history holdco --revision REVISION_KEY --output /tmp/recovered-context.json
+```
+
+`history` lists preserved versions and lets you inspect or export one by its full key or a unique prefix. Previous versions are kept separately from the current search index. Version preservation protects captures made after this feature is installed; it cannot reconstruct content lost before it was captured.
 
 `resume` prints notes; it does not launch an agent. Give the handoff to either agent in a new conversation, or use the recorded resume command when the original session is still on this computer. Project names that match more than one repository can be disambiguated with the repository identity shown in the handoff, such as `github.com/owner/project`.
 
@@ -57,9 +72,11 @@ llm-archive reopen                       # open directories as Ghostty tabs
 llm-archive reopen --resume              # also resume the latest local agent session per directory
 llm-archive reopen --project holdco      # restore just one project
 llm-archive reopen --days 7 --limit 50   # expand the default three days / ten directories
+llm-archive reopen --session SESSION_ID --resume # select a particular session
+llm-archive reopen --new-tabs           # explicitly allow tabs for directories already open
 ```
 
-The command opens one tab per distinct directory, with the project as its title. For a directory with several agent sessions, `--resume` selects the most recently active session. It executes only the fixed `codex resume ID` or `claude --resume ID` continuation command, never commands copied out of a transcript. Running it again can create additional tabs. It does not recover the previous split layout or detect which projects you intentionally closed.
+The command opens one tab per distinct directory, with the project as its title. It skips directories already reported open by Ghostty; `--new-tabs` overrides this, including when you want to resume a different session in an already-open directory. For a directory with several agent sessions, `--resume` selects the most recently active session unless `--session` names one explicitly. Find IDs with `status --sessions`. It executes only the fixed `codex resume ID` or `claude --resume ID` continuation command, never commands copied out of a transcript. It does not recover the previous split layout or detect which projects you intentionally closed. Duplicate detection relies on Ghostty's reported working directories, which may be unavailable before shell integration initializes.
 
 Requires **macOS and Ghostty 1.3+**, using its [native AppleScript API](https://ghostty.org/docs/features/applescript). macOS may request Automation permission the first time. Default tab restoration opens your normal shell; `--resume` explicitly starts the recorded agent session.
 
@@ -74,6 +91,21 @@ llm-archive resume holdco
 
 Mapping tries the original directory name, then the project name. Missing directories are reported and skipped; repositories are not cloned or switched to another branch automatically. An agent's native session can only be resumed when its original transcript exists on this device. Synced handoffs still work as context for a fresh conversation.
 
+### Named workspaces
+
+Save an explicit selection you can restore later:
+
+```bash
+llm-archive workspace save daily                         # recent local project directories
+llm-archive workspace save research --project holdco --project concrete2
+llm-archive workspace save current --from-tabs            # the directories open in Ghostty now
+llm-archive workspace list
+llm-archive reopen --workspace daily --dry-run
+llm-archive reopen --workspace daily --resume
+```
+
+A workspace records directories and the selected agent session per directory, including shell-only tabs when using `--from-tabs`. Saving the same local name updates that selection. It stores no terminal output, running processes, or arbitrary startup commands. Workspace definitions sync with the journal and can be restored on another computer using `--projects-root`. When several computers saved the same name, the local definition is preferred; use the `DEVICE_ID:NAME` selector shown by `workspace list` to choose a foreign definition.
+
 ### Private sync between computers
 
 Create a **separate, empty private Git repository** for journal data, then configure the same remote once on each computer:
@@ -86,7 +118,11 @@ llm-archive install-service
 
 Use an existing Git credential helper or an SSH key available without an interactive password prompt. Every checkpoint commits this computer's snapshot, fetches and imports other computers' updates, then pushes. You can also run `llm-archive sync` manually. Local capture continues when the remote is unavailable; the next checkpoint retries, and `status` reports the last successful sync and any error. Automated snapshot commits use the `llm-archive` identity and are unsigned.
 
-Each installation has a persistent device ID and owns a separate path in the sync repository. Exchanged JSONL records include stripped conversations, compact tool evidence, project/session metadata, directory paths, and computer names. These records can contain sensitive conversation or command output: use a private repository. The source-code repository is not the sync destination. The SQLite database, embeddings, agent credentials, and agent configuration files are not uploaded. Sync is disabled until `sync-init` is run.
+Each installation has a persistent device ID and owns a separate path in the sync repository. Sessions are stored as individual compressed `.json.gz` records, keeping Git objects small instead of rewriting one large combined archive. Exchanged records include stripped conversations, compact tool evidence, preserved transcript versions, named workspace definitions, project/session metadata, directory paths, and computer names. These records can contain sensitive conversation or command output: use a private repository. The source-code repository is not the sync destination. The SQLite database, embeddings, agent credentials, and agent configuration files are not uploaded. Sync is disabled until `sync-init` is run.
+
+Sync format version 2 can read older JSONL device snapshots and writes compressed session records. Upgrade the collector on every computer before using version 2; older collectors reject its format marker rather than silently overlooking new records.
+
+On each additional computer, install the same version of `llm-archive`, run `sync-init` with the same private remote, run `sync` to download existing context, and install the background service. Each computer then pulls and pushes at every checkpoint automatically. A repository existing on GitHub alone does not collect activity from computers without the collector installed.
 
 ### Checkpoint scheduling
 
@@ -101,7 +137,7 @@ macOS uses a launchd agent with an immediate check on login/load; Linux uses a s
 
 Only one ingest/sync writer runs at a time. Completed file updates commit individually, partial trailing JSONL records are retried after the writer finishes them, and file signatures let collection catch up after downtime. `status` distinguishes a successful scan from the latest source activity and remote sync. A sleeping, powered-off, or offline computer cannot checkpoint or upload new work; anything not yet written locally or synced can still be lost.
 
-**The journal preserves context, not source-code backups.** It records changed-file names but does not save file contents, untracked files, or uncommitted changes. Keep your normal code backup/Git workflow. Sessions with persistence disabled, remote-only sessions without local transcripts, and compressed `.jsonl.zst` archives are not captured. Transcript formats can change after agent upgrades; adapters may need updating, and `ingest --force` can then rebuild affected records.
+**The journal preserves context, not source-code backups.** It records changed-file names but does not save file contents, untracked files, or uncommitted changes. Keep your normal code backup/Git workflow. Sessions with persistence disabled and remote-only sessions without local transcripts are not captured. Transcript formats can change after agent upgrades; adapters may need updating, and `ingest --force` can then rebuild affected records while preserving previous versions when content changes.
 
 Custom locations are supported through `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, and `LLM_ARCHIVE_HOME`. The service preserves these variables and your `PATH` when installed. A newly configured custom source directory needs a service reinstall. Do not copy `device-id` between machines; each installation should have its own ID.
 
@@ -219,7 +255,9 @@ llm_archive/
 ├── db.py            # SQLite + FTS5 schema and queries
 ├── ingest.py        # wires parsers to database
 ├── journal.py       # recent activity, handoffs, and checkpoints
+├── overview.py      # project summaries and local/relative times
 ├── terminal.py      # Ghostty project-tab restoration
+├── workspaces.py    # named directory/session selections
 ├── sync.py          # per-device snapshots in a dedicated private Git repo
 ├── paths.py         # local state, device identity, and collector locking
 ├── projects.py      # repository/worktree identity
@@ -249,6 +287,7 @@ Everything lives under `~/.local/share/llm-archive/` (or `LLM_ARCHIVE_HOME`):
 | `ideas/YYYY-MM-DD.md` | Mined ideas and insights |
 | `ingest.log` | Auto-ingest log |
 | `journal/PROJECT-HASH.md` | Automatic project recovery handoffs |
+| `workspaces/` | Local and imported named workspace definitions |
 | `device-id` | Stable identity for this installation |
 | `config.json` | Journal sync configuration |
 | `sync/` | Optional clone of the dedicated private journal repository |

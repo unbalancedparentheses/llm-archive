@@ -48,11 +48,16 @@ def _apple_string(text: str) -> str:
 
 def ghostty_script(plan: list[dict]) -> str:
     lines = ['tell application "Ghostty"', 'activate', 'set targetWindow to missing value',
-             'if (count of windows) > 0 then set targetWindow to front window']
+             'set openedCount to 0', 'if (count of windows) > 0 then set targetWindow to front window']
     for p in plan:
         if not p["cwd"]:
             continue
-        lines += ['set cfg to new surface configuration',
+        lines += ['set alreadyOpen to false']
+        if not p.get("new_tab"):
+            lines += ['repeat with existingTerminal in terminals', 'try',
+                      f'if working directory of existingTerminal is {_apple_string(p["cwd"])} then set alreadyOpen to true',
+                      'end try', 'end repeat']
+        lines += ['if not alreadyOpen then', 'set cfg to new surface configuration',
                   f'set initial working directory of cfg to {_apple_string(p["cwd"])}']
         if p["command"]:
             # Only our fixed resume command is ever sent, not recorded shell commands.
@@ -61,8 +66,29 @@ def ghostty_script(plan: list[dict]) -> str:
                   'set targetWindow to new window with configuration cfg',
                   'set targetTab to selected tab of targetWindow', 'else',
                   'set targetTab to new tab in targetWindow with configuration cfg', 'end if',
-                  f'perform action {_apple_string("set_tab_title:" + p["project"])} on focused terminal of targetTab']
-    return "\n".join([*lines, 'end tell', ''])
+                  f'perform action {_apple_string("set_tab_title:" + p["project"])} on focused terminal of targetTab',
+                  'set openedCount to openedCount + 1', 'end if']
+    return "\n".join([*lines, 'end tell', 'return openedCount', ''])
+
+
+def ghostty_directories() -> set[str]:
+    """Read live directories without activating Ghostty or creating surfaces."""
+    if platform.system() != "Darwin":
+        raise RuntimeError("Reading Ghostty tabs requires macOS.")
+    script = '''if application "Ghostty" is not running then return ""
+tell application "Ghostty"
+    set paths to {}
+    repeat with term in terminals
+        set p to working directory of term
+        if p is not missing value and p is not "" then set end of paths to p
+    end repeat
+    set AppleScript's text item delimiters to character id 30
+    return paths as text
+end tell'''
+    result = subprocess.run(["osascript", "-"], input=script, text=True, capture_output=True, timeout=15)
+    if result.returncode:
+        raise RuntimeError("Could not read Ghostty directories: " + result.stderr.strip())
+    return {str(Path(p).resolve()) for p in result.stdout.rstrip("\n").split("\x1e") if p}
 
 
 def open_ghostty(plan: list[dict]) -> int:
@@ -74,4 +100,7 @@ def open_ghostty(plan: list[dict]) -> int:
     result = subprocess.run(["osascript", "-"], input=ghostty_script(plan), text=True, capture_output=True, timeout=60)
     if result.returncode:
         raise RuntimeError("Could not restore Ghostty tabs. Requires Ghostty 1.3+ and macOS Automation permission. " + result.stderr.strip())
-    return count
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        raise RuntimeError("Ghostty returned an unexpected restoration result") from None

@@ -6,6 +6,7 @@ from pathlib import Path
 from llm_archive.parsers import ParsedConversation, ParsedMessage, normalize_project
 from llm_archive.strip import strip_code_blocks
 from llm_archive.parsers.events import tool_event, result_event
+from llm_archive.parsers.files import open_transcript, transcript_files
 
 CODEX_SESSIONS = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser() / "sessions"
 
@@ -28,7 +29,7 @@ def parse_codex_sessions() -> Iterator[ParsedConversation]:
     if not CODEX_SESSIONS.is_dir():
         return
 
-    for jsonl_file in CODEX_SESSIONS.rglob("*.jsonl"):
+    for jsonl_file in transcript_files(CODEX_SESSIONS):
         conv = _parse_session(jsonl_file)
         if conv and conv.messages:
             yield conv
@@ -39,12 +40,12 @@ def _parse_session(path: Path) -> ParsedConversation | None:
     events = []
     git_branch = None
     is_subagent = False
-    session_id = path.stem
+    session_id = path.name.removesuffix(".zst").removesuffix(".jsonl")
     cwd = None
     started_at = None
 
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
+        with open_transcript(path) as f:
             for index, line in enumerate(f):
                 if not line.endswith("\n"):
                     continue  # The writer may still be appending this record.

@@ -16,7 +16,7 @@ from llm_archive.ingest import run_ingest
 MAX_GAP = timedelta(minutes=30)
 
 
-def _check_scheduler():
+def _check_scheduler(show_db=True):
     if not sys.stdout.isatty():
         return
     system = platform.system()
@@ -44,6 +44,8 @@ def _check_scheduler():
             else:
                 click.secho("auto-ingest: not installed (run: llm-archive install-cron)", fg="yellow")
 
+    if not show_db:
+        return
     db_path = db.DB_PATH
     if db_path.exists():
         mtime = datetime.fromtimestamp(db_path.stat().st_mtime)
@@ -58,9 +60,11 @@ def _check_scheduler():
 
 
 @click.group()
-def cli():
+@click.pass_context
+def cli(ctx):
     """Ingest, search, and analyze LLM conversations."""
-    _check_scheduler()
+    if ctx.invoked_subcommand != "status":
+        _check_scheduler()
 
 
 @cli.command()
@@ -612,31 +616,80 @@ def watch(interval):
 @click.option("--project", default=None, help="Project name or repository identity")
 @click.option("--limit", default=20, type=click.IntRange(min=1), show_default=True)
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable status and recent sessions")
-def status(days, project, limit, as_json):
+@click.option("--sessions", "show_sessions", is_flag=True, help="Show individual sessions instead of grouping by project")
+def status(days, project, limit, as_json, show_sessions):
     """See capture/sync health and recent work across projects and computers."""
     from llm_archive.journal import recent_sessions
     from llm_archive.paths import read_config
+    from llm_archive.overview import display_time, project_overview, session_summary
     conn = db.get_connection()
     try:
         state = db.get_state(conn)
-        sessions = recent_sessions(conn, days=days, project=project, limit=limit)
+        sessions = recent_sessions(conn, days=days, project=project, limit=10000)
+        projects = project_overview(conn, sessions)[:limit]
+        details = [{**s, **session_summary(conn, s)} for s in sessions[:limit]] if show_sessions else []
     finally:
         conn.close()
     if as_json:
-        click.echo(json.dumps({"collector": state, "sync_configured": bool(read_config().get("sync_directory")), "sessions": sessions}, indent=2))
+        click.echo(json.dumps({"collector": state, "sync_configured": bool(read_config().get("sync_directory")),
+                               "projects": projects, "sessions": details if show_sessions else sessions[:limit]}, indent=2))
         return
-    click.echo(f"Last check:      {state.get('last_check', 'never')}")
-    click.echo(f"Last successful: {state.get('last_success', 'never')}")
-    click.echo(f"Last sync:       {state.get('last_sync', 'never') if read_config().get('sync_directory') else 'not configured'}")
+    _check_scheduler(show_db=False)
+    click.echo(f"Last check:      {display_time(state.get('last_check'))}")
+    click.echo(f"Last successful: {display_time(state.get('last_success'))}")
+    click.echo(f"Last sync:       {display_time(state.get('last_sync')) if read_config().get('sync_directory') else 'not configured'}")
     for key in ("capture_error", "sync_error"):
         if state.get(key):
             click.secho(f"{key}: {state[key]}", fg="yellow")
     click.echo()
-    for s in sessions:
-        click.echo(f"{s['last_activity'] or s['started_at']}  {s['project']}  [{s['source']}]  {s.get('git_branch') or ''}")
-        click.echo(f"  {s.get('machine') or 'unknown computer'}: {s.get('cwd') or 'directory not recorded'}")
+    for p in details if show_sessions else projects:
+        if show_sessions:
+            click.secho(f"{p['project']}  [{p['source']}]  {p.get('git_branch') or ''}  {p['session_id']}", bold=True)
+            click.echo(f"  {display_time(p.get('last_activity') or p['started_at'])} · {p.get('machine') or 'unknown computer'}")
+            click.echo(f"  {p.get('cwd') or 'directory not recorded'}")
+        else:
+            click.secho(f"{p['project']}  · {p['session_count']} sessions · {', '.join(p['sources'])}", bold=True)
+            click.echo(f"  {display_time(p['last_activity'])}")
+        click.echo(f"  Task: {p['task']}")
+        click.echo(f"  Update: {p['last_update']}")
+        click.echo(f"  Next (reported): {p['next_step']}")
+        click.echo()
     if not sessions:
         click.echo("No recent sessions. Run llm-archive checkpoint to capture existing history.")
+
+
+@cli.command()
+@click.argument("project")
+@click.option("--session", "session_id", help="Only versions of this session")
+@click.option("--revision", help="Print a previous version by its key or unique prefix")
+@click.option("--output", type=click.Path(path_type=Path), help="Save the selected version as JSON")
+def history(project, session_id, revision, output):
+    """Inspect preserved versions of rewritten or truncated transcripts."""
+    from llm_archive.overview import display_time
+    from llm_archive.paths import atomic_write
+    conn = db.get_connection()
+    try:
+        records = db.revisions(conn, project, session_id)
+    finally:
+        conn.close()
+    if revision:
+        matches = [r for r in records if r["revision_key"].startswith(revision)]
+        if len(matches) != 1:
+            raise click.ClickException("Revision not found or prefix is ambiguous.")
+        text = json.dumps(json.loads(matches[0]["snapshot"]), indent=2, ensure_ascii=False)
+        if output:
+            atomic_write(output, text + "\n")
+            click.echo(f"Saved preserved version to {output}")
+        else:
+            click.echo(text)
+        return
+    if output:
+        raise click.ClickException("Use --revision when saving a version.")
+    for r in records:
+        snapshot = json.loads(r["snapshot"])
+        click.echo(f"{r['revision_key'][:12]}  {display_time(r['captured_at'])}  [{r['source']}] {r['session_id']}  {len(snapshot['messages'])} messages")
+    if not records:
+        click.echo("No previous versions recorded; existing captured versions are preserved when a transcript is rewritten.")
 
 
 @cli.command()
@@ -672,21 +725,46 @@ def resume(project, days, session_id, output):
 @click.option("--resume", "resume_agents", is_flag=True, help="Resume the latest local agent session in each directory")
 @click.option("--projects-root", type=click.Path(exists=True, file_okay=False, path_type=Path), help="Find local checkouts under this directory on another computer")
 @click.option("--dry-run", is_flag=True, help="Preview tabs and commands without opening Ghostty")
-def reopen(days, project, limit, resume_agents, projects_root, dry_run):
+@click.option("--session", "session_id", help="Choose a specific session instead of the latest in its directory")
+@click.option("--workspace", "workspace_name", help="Restore a saved workspace")
+@click.option("--new-tabs", is_flag=True, help="Open additional tabs even for directories already open in Ghostty")
+def reopen(days, project, limit, resume_agents, projects_root, dry_run, session_id, workspace_name, new_tabs):
     """Restore recent project/worktree directories as Ghostty tabs (macOS)."""
     from llm_archive.journal import recent_sessions
-    from llm_archive.terminal import open_ghostty, reopen_plan
+    from llm_archive.terminal import open_ghostty, reopen_plan, ghostty_directories
     conn = db.get_connection()
     try:
-        sessions = recent_sessions(conn, days=days, project=project, limit=10000)
+        if workspace_name:
+            from llm_archive.workspaces import load
+            sessions = load(workspace_name)["sessions"]
+            if project:
+                sessions = [s for s in sessions if s["project"] == project or s.get("project_key") == project]
+        else:
+            sessions = recent_sessions(conn, days=36500 if session_id else days, project=project, limit=10000)
+        if session_id:
+            sessions = [s for s in sessions if s["session_id"] == session_id]
+            if not sessions:
+                raise ValueError("Session not found; use llm-archive status --sessions to choose an ID.")
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     finally:
         conn.close()
     plan = reopen_plan(sessions, resume=resume_agents, projects_root=projects_root)[:limit]
+    for p in plan:
+        p["new_tab"] = new_tabs
     if not plan:
         click.echo("No recent project directories. Run checkpoint or increase --days.")
         return
+    existing = set()
+    if dry_run and not new_tabs and platform.system() == "Darwin":
+        try:
+            existing = ghostty_directories()
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            click.echo(f"Existing tabs could not be inspected: {exc}", err=True)
     for p in plan:
         click.echo(f"{p['project']}: {p['cwd'] or 'skipped'}")
+        if p["cwd"] in existing:
+            click.echo("  Already open; will be skipped (use --new-tabs to open another).")
         if p["command"]:
             click.echo(f"  {p['command']}")
         if p["note"]:
@@ -697,6 +775,47 @@ def reopen(days, project, limit, resume_agents, projects_root, dry_run):
         click.echo(f"Opened {open_ghostty(plan)} Ghostty tabs.")
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         raise click.ClickException(str(exc)) from exc
+
+
+@cli.group()
+def workspace():
+    """Save and inspect named project workspaces."""
+
+
+@workspace.command(name="save")
+@click.argument("name")
+@click.option("--days", default=3, type=click.IntRange(min=1), show_default=True)
+@click.option("--project", "projects", multiple=True, help="Include only these projects (repeatable)")
+@click.option("--from-tabs", is_flag=True, help="Save the directories currently open in Ghostty")
+def workspace_save(name, days, projects, from_tabs):
+    from llm_archive.journal import recent_sessions
+    from llm_archive.workspaces import save
+    from llm_archive.terminal import ghostty_directories
+    conn = db.get_connection()
+    try:
+        sessions = recent_sessions(conn, days=days, limit=10000)
+        if projects:
+            sessions = [s for s in sessions if s["project"] in projects or s.get("project_key") in projects]
+        directories = ghostty_directories() if from_tabs else None
+        if directories is not None and projects:
+            directories &= {str(Path(s["cwd"]).resolve()) for s in sessions if s.get("cwd")}
+        record = save(name, sessions, directories=directories)
+    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        conn.close()
+    click.echo(f"Saved {len(record['sessions'])} directories as {name}. Restore with: llm-archive reopen --workspace {name}")
+
+
+@workspace.command(name="list")
+def workspace_list():
+    from llm_archive.workspaces import list_workspaces
+    from llm_archive.overview import display_time
+    records = list_workspaces()
+    for record in records:
+        click.echo(f"{record['selector']}  {len(record['sessions'])} directories  {display_time(record['saved_at'])}")
+    if not records:
+        click.echo("No saved workspaces. Use: llm-archive workspace save NAME")
 
 
 @cli.command(name="sync-init")

@@ -8,6 +8,7 @@ from llm_archive.parsers.codex import _parse_session as parse_codex
 from llm_archive.parsers import normalize_project
 from llm_archive.paths import collector_lock
 from llm_archive.projects import repository
+from llm_archive.parsers.files import transcript_files
 
 
 def source_roots() -> list[tuple[str, Path]]:
@@ -31,7 +32,7 @@ def _run_ingest(force: bool = False) -> tuple[int, int]:
         for source, root in source_roots():
             if not root.is_dir():
                 continue
-            for path in root.rglob("*.jsonl"):
+            for path in transcript_files(root):
                 try:
                     stat = path.stat()
                     key = str(path.resolve())
