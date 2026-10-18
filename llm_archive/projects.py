@@ -8,14 +8,18 @@ from urllib.parse import urlsplit
 from llm_archive.parsers import normalize_project
 
 
-def git(cwd: str, *args: str) -> str:
+def git_output(cwd: str, *args: str, timeout: float = 5) -> str | None:
     try:
         result = subprocess.run(
-            ["git", "-C", cwd, *args], capture_output=True, text=True, timeout=5,
+            ["git", "-C", cwd, *args], capture_output=True, text=True, timeout=timeout,
         )
-        return result.stdout.strip() if result.returncode == 0 else ""
+        return result.stdout.strip() if result.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired):
-        return ""
+        return None
+
+
+def git(cwd: str, *args: str) -> str:
+    return git_output(cwd, *args) or ""
 
 
 def canonical_remote(remote: str) -> str:

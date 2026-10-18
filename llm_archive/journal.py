@@ -7,7 +7,7 @@ from pathlib import Path
 
 from llm_archive import db
 from llm_archive.paths import atomic_write, data_dir, device_id
-from llm_archive.projects import git
+from llm_archive.projects import git_output
 
 
 def recent_sessions(conn, days=7, project=None, limit=100) -> list[dict]:
@@ -42,9 +42,10 @@ def local_workspace(session: dict) -> bool:
     return session.get("origin_device") == device_id()
 
 
-def handoff(conn, sessions: list[dict]) -> str:
+def handoff(conn, sessions: list[dict], workspace_cache=None, git_timeout=5) -> str:
     if not sessions:
         return "No matching activity found.\n"
+    workspace_cache = {} if workspace_cache is None else workspace_cache
     lines = [f"# {sessions[0]['project']} — work handoff", "",
              "Captured conversation excerpts and tool evidence. Completion and next steps must be verified.", ""]
     for s in sessions:
@@ -63,11 +64,16 @@ def handoff(conn, sessions: list[dict]) -> str:
             for e in reversed(events):
                 lines += [f"**{e['kind']}** ({e['timestamp']}):", "", "````text", e["content"], "````", ""]
         if local_workspace(s) and s.get("cwd") and Path(s["cwd"]).is_dir():
-            branch = git(s["cwd"], "branch", "--show-current")
-            head = git(s["cwd"], "rev-parse", "--short", "HEAD")
-            status = git(s["cwd"], "status", "--short")
-            lines += ["### Local working tree", "", f"Observed at {db.utc_now()}; current branch `{branch}`, HEAD `{head}`.",
-                      "", "````text", status or ("Working tree clean." if head else "Git state unavailable."), "````", ""]
+            cwd = s["cwd"]
+            if cwd not in workspace_cache:
+                workspace_cache[cwd] = (
+                    git_output(cwd, "branch", "--show-current", timeout=git_timeout),
+                    git_output(cwd, "rev-parse", "--short", "HEAD", timeout=git_timeout),
+                    git_output(cwd, "status", "--short", timeout=git_timeout), db.utc_now(),
+                )
+            branch, head, status, observed = workspace_cache[cwd]
+            lines += ["### Local working tree", "", f"Observed at {observed}; current branch `{branch or 'unavailable'}`, HEAD `{head or 'unavailable'}`.",
+                      "", "````text", "Working-tree status unavailable." if status is None else status or "Working tree clean.", "````", ""]
         if local_session(s) and s.get("cwd") and Path(s["cwd"]).is_dir():
             lines += ["Resume this conversation:", "", "```sh", f"cd -- {shlex.quote(s['cwd'])}", resume_command(s), "```", ""]
         else:
@@ -79,12 +85,14 @@ def handoff(conn, sessions: list[dict]) -> str:
 
 def write_handoffs(conn, days=7) -> int:
     groups = defaultdict(list)
+    workspace_cache = {}
     for s in recent_sessions(conn, days=days, limit=10000):
         groups[s.get("project_key") or s["project"]].append(s)
     for key, sessions in groups.items():
         name = re.sub(r"[^a-zA-Z0-9_-]", "-", sessions[0]["project"])
         digest = hashlib.sha256(key.encode()).hexdigest()[:10]
-        atomic_write(data_dir() / "journal" / f"{name}-{digest}.md", handoff(conn, sessions[:5]))
+        atomic_write(data_dir() / "journal" / f"{name}-{digest}.md",
+                     handoff(conn, sessions[:5], workspace_cache=workspace_cache, git_timeout=1))
     return len(groups)
 
 

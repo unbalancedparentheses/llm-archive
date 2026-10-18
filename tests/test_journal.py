@@ -122,6 +122,26 @@ class JournalTests(unittest.TestCase):
         conn.close()
         self.assertEqual(len(list((db.DB_DIR / "journal").glob("*.md"))), 1)
 
+    def test_handoffs_only_probe_each_working_directory_once(self):
+        self.codex_file()
+        self.codex_file(name="another-session")
+        ingest.run_ingest()
+        conn = db.get_connection()
+        with patch("llm_archive.journal.git_output", return_value="") as probe:
+            handoff(conn, recent_sessions(conn))
+        self.assertEqual(probe.call_count, 3)
+        conn.close()
+
+    def test_unavailable_git_status_is_not_reported_as_clean(self):
+        self.codex_file()
+        ingest.run_ingest()
+        conn = db.get_connection()
+        with patch("llm_archive.journal.git_output", side_effect=["main", "abc123", None]):
+            text = handoff(conn, recent_sessions(conn))
+        self.assertIn("Working-tree status unavailable", text)
+        self.assertNotIn("Working tree clean", text)
+        conn.close()
+
     def test_claude_main_and_subagent_sessions_do_not_overwrite_each_other(self):
         project = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects/-Users-person-projects-widget"
         (project / "parent/subagents").mkdir(parents=True)
