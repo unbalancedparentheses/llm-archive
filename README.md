@@ -16,6 +16,7 @@ llm-archive checkpoint     # capture current work and write project handoffs
 llm-archive install-service # checkpoint every two minutes + on login
 llm-archive status         # grouped projects, task excerpts, and capture/sync health
 llm-archive reopen --dry-run # preview recent project tabs
+llm-archive automation enable # macOS: also save live tabs and recover automatically
 ```
 
 Use a virtual environment if your Python installation requires one:
@@ -64,7 +65,33 @@ llm-archive history holdco --revision REVISION_KEY --output /tmp/recovered-conte
 
 ### Reopen your projects in Ghostty
 
-After a crash, reboot, or break, restore recent project directories and worktrees with one command:
+For hands-off recovery on macOS, enable it once:
+
+```bash
+llm-archive automation enable
+```
+
+This installs both the two-minute capture/sync service and a separate Ghostty observer. Continue starting Claude and Codex normally. The observer checks live terminals every **10 seconds** and maintains the `automatic` workspace, including multiple conversations in the same directory. It uses Claude's live session registrations and Codex's open transcript/writer files and session titles to identify the conversations actually running. Ambiguous terminals are saved as shell tabs rather than assigned a different conversation.
+
+On your next login, it starts Ghostty if needed. When Ghostty relaunches after quitting or crashing, it waits for the app to settle, then opens the saved directories and resumes the identified local sessions automatically. Already-running agent sessions are skipped. Quitting Ghostty does not make it immediately pop back open; your next login or Ghostty launch triggers recovery. Closing individual tabs, or all windows while Ghostty keeps running, updates the saved workspace after the next stable observation. A quit or crash preserves the last captured workspace. Changes made immediately before a crash may fall between observations.
+
+Snapshots are local first and join the existing private sync at the next checkpoint; recovery works offline. The observer runs separately so a slow Git push cannot block workspace capture. No prompts are submitted to agents and no commands from transcripts are replayed. Normal operation needs no save or reopen commands.
+
+```bash
+llm-archive automation status             # last check, capture, recovery, tab/session counts
+llm-archive status                        # includes automatic recovery health
+llm-archive automation disable            # stop tab recovery; keep capture and private sync
+llm-archive automation recover --dry-run  # optional preview of what is still missing
+llm-archive automation recover            # retry after a reported recovery error
+```
+
+If a recovery is interrupted or fails partway through, the original snapshot is retained and the observer stops retrying that launch to avoid repeated tabs. `status` reports the error; `automation recover` retries only missing sessions. macOS may require one-time Automation permission for the background observer to control Ghostty.
+
+Enabling recovery adds a marked `window-save-state = never` override to `~/Library/Application Support/com.mitchellh.ghostty/config`. This [macOS configuration file loads after XDG configuration](https://ghostty.org/docs/config), so native restoration does not create a second copy of the saved windows. Your other settings are retained, including Nix-managed XDG configuration. Disabling recovery removes only this block and reloads the previous settings. An edited block or a symlinked macOS override file is reported instead of overwritten.
+
+Recovery recreates terminals as tabs; it does not reconstruct split/window layouts, arbitrary programs, or uncommitted source files. The observer never types into or closes an existing terminal. Shell integration must report a working directory to recover a shell-only tab; a missing directory on a newly opened shell is reported and does not block other sessions. Agent identification depends on the native metadata available in your installed agent versions. On another computer, install/configure the collector once: synced workspaces and handoffs are available there, but original native transcripts and source checkouts must exist locally for an exact agent resume. Automatic recovery uses this computer's own workspace, so it does not unexpectedly open another computer's tabs.
+
+For occasional manual restoration, restore recent project directories and worktrees with one command:
 
 ```bash
 llm-archive reopen --dry-run             # preview; no windows or tabs are opened
@@ -104,7 +131,7 @@ llm-archive reopen --workspace daily --dry-run
 llm-archive reopen --workspace daily --resume
 ```
 
-A workspace records directories and the selected agent session per directory, including shell-only tabs when using `--from-tabs`. Saving the same local name updates that selection. It stores no terminal output, running processes, or arbitrary startup commands. Workspace definitions sync with the journal and can be restored on another computer using `--projects-root`. When several computers saved the same name, the local definition is preferred; use the `DEVICE_ID:NAME` selector shown by `workspace list` to choose a foreign definition.
+A manually saved workspace records directories and the selected agent session per directory, including shell-only tabs when using `--from-tabs`. Saving the same local name updates that selection. The observer manages the reserved `automatic` workspace and preserves individual conversations there; use `automation recover` to restore all of them. Workspace files store no terminal output or arbitrary startup commands. Definitions sync with the journal and can be restored on another computer using `--projects-root`. When several computers saved the same name, the local definition is preferred; use the `DEVICE_ID:NAME` selector shown by `workspace list` to choose a foreign definition.
 
 ### Private sync between computers
 
@@ -257,6 +284,8 @@ llm_archive/
 ├── journal.py       # recent activity, handoffs, and checkpoints
 ├── overview.py      # project summaries and local/relative times
 ├── terminal.py      # Ghostty project-tab restoration
+├── recovery.py      # live workspace observer and automatic agent recovery
+├── ghostty_config.py # reversible coordination with native window restoration
 ├── workspaces.py    # named directory/session selections
 ├── sync.py          # per-device snapshots in a dedicated private Git repo
 ├── paths.py         # local state, device identity, and collector locking
@@ -288,6 +317,7 @@ Everything lives under `~/.local/share/llm-archive/` (or `LLM_ARCHIVE_HOME`):
 | `ingest.log` | Auto-ingest log |
 | `journal/PROJECT-HASH.md` | Automatic project recovery handoffs |
 | `workspaces/` | Local and imported named workspace definitions |
+| `recovery-state.json`, `recovery.log` | Local observer health and recovery attempts |
 | `device-id` | Stable identity for this installation |
 | `config.json` | Journal sync configuration |
 | `sync/` | Optional clone of the dedicated private journal repository |

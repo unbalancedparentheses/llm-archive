@@ -57,6 +57,7 @@ def uninstall() -> str:
 # --- macOS launchd ---
 
 LAUNCHD_LABEL = "com.llm-archive.ingest"
+RECOVERY_LABEL = "com.llm-archive.recovery"
 LAUNCHD_DIR = Path.home() / "Library" / "LaunchAgents"
 
 
@@ -98,6 +99,34 @@ def _uninstall_launchd() -> str:
     subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
     plist_path.unlink()
     return f"Removed launchd agent: {plist_path}"
+
+
+def install_recovery() -> str:
+    if platform.system() != "Darwin":
+        raise RuntimeError("Automatic Ghostty recovery currently requires macOS.")
+    from llm_archive.paths import data_dir
+    binary = _find_binary()
+    log = str(data_dir() / "recovery.log")
+    path = LAUNCHD_DIR / f"{RECOVERY_LABEL}.plist"
+    LAUNCHD_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(plistlib.dumps({
+        "Label": RECOVERY_LABEL, "ProgramArguments": [binary, "recovery-watch"],
+        "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 30,
+        "LimitLoadToSessionType": "Aqua",
+        "EnvironmentVariables": _environment(), "StandardOutPath": log, "StandardErrorPath": log,
+    }))
+    subprocess.run(["launchctl", "unload", str(path)], capture_output=True)
+    subprocess.run(["launchctl", "load", str(path)], capture_output=True, check=True)
+    return f"Installed automatic Ghostty recovery: {path}\nObserves live tabs every 10 seconds; restores on login and Ghostty relaunch.\nLog: {log}"
+
+
+def uninstall_recovery() -> str:
+    path = LAUNCHD_DIR / f"{RECOVERY_LABEL}.plist"
+    if not path.exists():
+        return "Automatic Ghostty recovery is not installed."
+    subprocess.run(["launchctl", "unload", str(path)], capture_output=True)
+    path.unlink()
+    return "Disabled automatic Ghostty recovery. Capture and private sync remain installed."
 
 
 # --- Linux systemd ---

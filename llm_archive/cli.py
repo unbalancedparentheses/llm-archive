@@ -622,6 +622,8 @@ def status(days, project, limit, as_json, show_sessions):
     from llm_archive.journal import recent_sessions
     from llm_archive.paths import read_config
     from llm_archive.overview import display_time, project_overview, session_summary
+    from llm_archive.recovery import read_state
+    recovery = {"enabled": bool(read_config().get("automatic_recovery")), **read_state()}
     conn = db.get_connection()
     try:
         state = db.get_state(conn)
@@ -631,13 +633,21 @@ def status(days, project, limit, as_json, show_sessions):
     finally:
         conn.close()
     if as_json:
-        click.echo(json.dumps({"collector": state, "sync_configured": bool(read_config().get("sync_directory")),
+        click.echo(json.dumps({"collector": state, "sync_configured": bool(read_config().get("sync_directory")), "recovery": recovery,
                                "projects": projects, "sessions": details if show_sessions else sessions[:limit]}, indent=2))
         return
     _check_scheduler(show_db=False)
     click.echo(f"Last check:      {display_time(state.get('last_check'))}")
     click.echo(f"Last successful: {display_time(state.get('last_success'))}")
     click.echo(f"Last sync:       {display_time(state.get('last_sync')) if read_config().get('sync_directory') else 'not configured'}")
+    if recovery["enabled"]:
+        click.echo(f"Auto recovery:   enabled · {recovery.get('saved_tabs', 0)} tabs / {recovery.get('resumable_tabs', 0)} agent sessions")
+        click.echo(f"Workspace saved: {display_time(recovery.get('last_capture'))}")
+        click.echo(f"Recovery check:  {display_time(recovery.get('last_check'))}")
+        if recovery.get("unknown_directories"):
+            click.echo(f"  {recovery['unknown_directories']} shell tabs have no reported directory and cannot yet be restored.")
+        if recovery.get("error"):
+            click.secho(f"recovery_error: {recovery['error']}", fg="yellow")
     for key in ("capture_error", "sync_error"):
         if state.get(key):
             click.secho(f"{key}: {state[key]}", fg="yellow")
@@ -842,6 +852,64 @@ def sync():
     except (RuntimeError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Synced journal; imported {count} session updates.")
+
+
+@cli.group()
+def automation():
+    """Enable hands-off capture, private sync, and Ghostty workspace recovery."""
+
+
+@automation.command(name="enable")
+def automation_enable():
+    """Install capture/sync plus automatic live-tab saving and agent recovery (macOS)."""
+    from llm_archive.recovery import enable
+    try:
+        for message in enable():
+            click.echo(message)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@automation.command(name="disable")
+def automation_disable():
+    """Stop automatic tab saving/recovery; keep background capture and sync."""
+    from llm_archive.recovery import disable
+    try:
+        click.echo(disable())
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@automation.command(name="status")
+def automation_status():
+    """Show workspace recovery health without opening Ghostty."""
+    from llm_archive.paths import read_config
+    from llm_archive.recovery import read_state
+    click.echo(json.dumps({"enabled": bool(read_config().get("automatic_recovery")), **read_state()}, indent=2))
+
+
+@automation.command(name="recover")
+@click.option("--dry-run", is_flag=True, help="Preview recovery without opening tabs")
+def automation_recover(dry_run):
+    """Retry the automatic workspace after a recovery error, skipping running agents."""
+    from llm_archive.recovery import recover
+    try:
+        plan = recover(dry_run=dry_run)
+        click.echo(json.dumps(plan, indent=2))
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.command(name="recovery-watch", hidden=True)
+def recovery_watch():
+    """Internal foreground observer managed by launchd."""
+    from llm_archive.recovery import run
+    try:
+        run()
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    except KeyboardInterrupt:
+        pass
 
 
 cli.add_command(install_cron, "install-service")

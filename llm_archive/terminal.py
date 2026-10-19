@@ -1,10 +1,30 @@
 """Restore recent project directories through Ghostty's native AppleScript API."""
 import platform
+import json
 import shutil
 import subprocess
 from pathlib import Path
 
 from llm_archive.journal import local_session, local_workspace, resume_command
+
+
+def ghostty_terminals() -> list[dict]:
+    """Read individual surfaces, including several conversations in one directory."""
+    if platform.system() != "Darwin":
+        raise RuntimeError("Reading Ghostty tabs requires macOS.")
+    script = """const g = Application('Ghostty');
+JSON.stringify(g.running() ? g.terminals().map(t => {
+    const p = t.properties();
+    return {id: p.id, title: p.name, cwd: p.workingDirectory};
+}) : []);"""
+    result = subprocess.run(["osascript", "-l", "JavaScript", "-"], input=script,
+                            text=True, capture_output=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError("Could not read Ghostty tabs: " + result.stderr.strip())
+    rows = json.loads(result.stdout)
+    if not isinstance(rows, list):
+        raise RuntimeError("Ghostty returned an invalid tab inventory")
+    return rows
 
 
 def reopen_plan(sessions: list[dict], resume=False, projects_root: Path | None = None) -> list[dict]:

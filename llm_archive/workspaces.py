@@ -17,6 +17,8 @@ def validate_name(name: str) -> str:
 
 def save(name: str, sessions: list[dict], directories: set[str] | None = None) -> dict:
     validate_name(name)
+    if name == "automatic":
+        raise ValueError("The automatic workspace is managed by the recovery observer. Choose another name.")
     chosen = []
     seen = set()
     for s in sessions:
