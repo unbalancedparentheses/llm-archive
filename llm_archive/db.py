@@ -132,7 +132,7 @@ def revisions(conn, project: str, session_id: str | None = None) -> list[dict]:
 def upsert_conversation(conn, conv: ParsedConversation, metadata: dict | None = None) -> tuple[bool, int]:
     """Refresh growing transcripts, preserving IDs for unchanged messages/embeddings."""
     info = metadata if metadata is not None else {
-        **repository(conv.cwd), "machine": machine_name(), "source_path": conv.source_path,
+        **repository(conv.cwd, conv.repo_url), "machine": machine_name(), "source_path": conv.source_path,
         "collected_at": utc_now(), "is_subagent": int(conv.is_subagent), "origin_device": device_id(),
     }
     activity = max([m.timestamp for m in conv.messages] + [e.timestamp for e in conv.events] + [conv.started_at or ""])
@@ -146,6 +146,12 @@ def upsert_conversation(conn, conv: ParsedConversation, metadata: dict | None = 
               info.get("repo_url", ""), info.get("machine", ""), info.get("source_path", ""), activity,
               info.get("collected_at", utc_now()), int(info.get("is_subagent", conv.is_subagent)), info.get("origin_device", "")]
     existing = conn.execute("SELECT * FROM conversations WHERE session_id = ?", (conv.session_id,)).fetchone()
+    if (existing and existing["project_key"] and not existing["project_key"].startswith("directory:")
+            and values[columns.index("project_key")].startswith("directory:")
+            and existing["cwd"] == values[columns.index("cwd")]):
+        # The checkout was deleted after capture; keep the repository found while it existed.
+        for column in ("project", "repo_root", "project_key", "repo_url"):
+            values[columns.index(column)] = existing[column]
     if existing:
         conv_id = existing["id"]
         before = conversation_record(conn, conv_id)

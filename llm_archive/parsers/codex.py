@@ -43,6 +43,7 @@ def _parse_session(path: Path) -> ParsedConversation | None:
     session_id = path.name.removesuffix(".zst").removesuffix(".jsonl")
     cwd = None
     started_at = None
+    repo_url = ""
 
     try:
         with open_transcript(path) as f:
@@ -67,6 +68,7 @@ def _parse_session(path: Path) -> ParsedConversation | None:
                     cwd = payload.get("cwd")
                     started_at = payload.get("timestamp")
                     git_branch = (payload.get("git") or {}).get("branch")
+                    repo_url = (payload.get("git") or {}).get("repository_url") or ""
                     source = payload.get("source", {})
                     is_subagent = isinstance(source, dict) and "subagent" in source
                     continue
@@ -121,4 +123,5 @@ def _parse_session(path: Path) -> ParsedConversation | None:
         source_path=str(path.resolve()),
         is_subagent=is_subagent,
         events=events,
+        repo_url=repo_url,
     )

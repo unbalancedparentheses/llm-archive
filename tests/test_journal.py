@@ -16,7 +16,7 @@ from llm_archive.cli import cli
 from llm_archive.journal import checkpoint, handoff, recent_sessions, resume_command
 from llm_archive.parsers import ParsedConversation, ParsedMessage
 from llm_archive.paths import collector_lock, device_id
-from llm_archive.projects import canonical_remote, repository
+from llm_archive.projects import canonical_remote, claude_encoded, repository
 from llm_archive.terminal import ghostty_script, reopen_plan
 from llm_archive.overview import display_time, project_overview
 from llm_archive import workspaces
@@ -319,6 +319,54 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(repository(str(worktree))["project"], "widget")
         self.assertEqual(canonical_remote("git@github.com:example/widget.git"), "github.com/example/widget")
         self.assertNotIn("secret", repository(str(root))["repo_url"])
+
+    def test_deleted_worktrees_keep_their_repository(self):
+        root = self.root / "repository"
+        root.mkdir()
+        git(root, "init", "-b", "main")
+        git(root, "remote", "add", "origin", "git@github.com:example/widget.git")
+        repository.cache_clear()
+        gone = str(root / ".claude/worktrees/agent-1")
+        self.assertEqual(repository(gone)["project_key"], "github.com/example/widget")
+        self.assertEqual(repository(gone)["cwd"], gone)
+        recorded = repository(str(self.root / "review-510"), "https://github.com/example/widget.git")
+        self.assertEqual((recorded["project_key"], recorded["project"]), ("github.com/example/widget", "widget"))
+        scratchpad = f"/private/tmp/claude-501/{claude_encoded(str(root.resolve()))}/session/scratchpad/review"
+        self.assertEqual(repository(scratchpad)["project_key"], "github.com/example/widget")
+        self.assertTrue(repository(str(self.root / "unrelated"))["project_key"].startswith("directory:"))
+
+    def test_deleting_a_checkout_does_not_forget_its_repository(self):
+        root = self.root / "repository"
+        root.mkdir()
+        git(root, "init", "-b", "main")
+        git(root, "remote", "add", "origin", "git@github.com:example/widget.git")
+        worktree = root / "nested"
+        path = self.codex_file(cwd=worktree)
+        repository.cache_clear()
+        ingest.run_ingest()
+        worktree.rmdir()
+        repository.cache_clear()
+        self.message(path, "assistant", "Done")
+        ingest.run_ingest()
+        self.assertEqual(self.sessions()[0]["project_key"], "github.com/example/widget")
+
+    def test_forced_ingest_reidentifies_sessions_whose_transcripts_are_gone(self):
+        root = self.root / "repository"
+        root.mkdir()
+        git(root, "init", "-b", "main")
+        git(root, "remote", "add", "origin", "git@github.com:example/widget.git")
+        worktree = root / ".claude/worktrees/agent-1"
+        worktree.mkdir(parents=True)
+        path = self.codex_file(cwd=worktree)
+        ingest.run_ingest()
+        conn = db.get_connection()
+        conn.execute("UPDATE conversations SET project = 'agent-1', project_key = ?", ("directory:" + str(worktree),))
+        conn.commit()
+        conn.close()
+        path.unlink()
+        worktree.rmdir()
+        ingest.run_ingest(force=True)
+        self.assertEqual(self.sessions()[0]["project_key"], "github.com/example/widget")
 
     def test_reopen_deduplicates_directories_and_does_not_replay_commands(self):
         path = self.codex_file()

@@ -6,7 +6,7 @@ from llm_archive import db
 from llm_archive.parsers.claude import _parse_session as parse_claude, _extract_project
 from llm_archive.parsers.codex import _parse_session as parse_codex
 from llm_archive.parsers import normalize_project
-from llm_archive.paths import collector_lock
+from llm_archive.paths import collector_lock, device_id
 from llm_archive.projects import repository
 from llm_archive.parsers.files import transcript_files
 
@@ -53,6 +53,8 @@ def _run_ingest(force: bool = False) -> tuple[int, int]:
                     conn.commit()
                 except OSError as exc:
                     errors.append(f"{path}: {exc}")
+        if force:
+            reidentify_archived(conn)
         db.set_state(conn, "last_check", db.utc_now())
         if not errors:
             db.set_state(conn, "last_success", db.utc_now())
@@ -63,3 +65,15 @@ def _run_ingest(force: bool = False) -> tuple[int, int]:
         return updated, new_msgs
     finally:
         conn.close()
+
+
+def reidentify_archived(conn) -> None:
+    """Sessions whose transcripts are gone are never reparsed; retry the repository fallbacks on them."""
+    rows = conn.execute("SELECT id, cwd FROM conversations WHERE project_key LIKE 'directory:%' AND origin_device = ?",
+                        (device_id(),)).fetchall()
+    for conv_id, cwd in rows:
+        found = repository(cwd)
+        if not found["project_key"].startswith("directory:"):
+            conn.execute("UPDATE conversations SET project = ?, project_key = ?, repo_url = ? WHERE id = ?",
+                         (found["project"], found["project_key"], found["repo_url"], conv_id))
+    conn.commit()

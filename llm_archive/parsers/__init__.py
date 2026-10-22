@@ -42,3 +42,4 @@ class ParsedConversation:
     source_path: str = ""
     is_subagent: bool = False
     events: list[ParsedEvent] = field(default_factory=list)
+    repo_url: str = ""  # Remote the agent recorded; identifies a checkout deleted before capture.
