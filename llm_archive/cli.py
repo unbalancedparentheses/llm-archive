@@ -854,6 +854,32 @@ def sync():
     click.echo(f"Synced journal; imported {count} session updates.")
 
 
+@cli.command()
+@click.option("--sync-history", is_flag=True,
+              help="Also replace the private journal's Git history with one commit and force-push it.")
+def compact(sync_history):
+    """Drop preserved versions that only repeat the current conversation, and shrink storage."""
+    from llm_archive.paths import collector_lock, read_config
+    with collector_lock():
+        conn = db.get_connection()
+        try:
+            pruned = db.prune_redundant_revisions(conn)
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+    click.echo(f"Removed {pruned} preserved versions that repeated the current conversation.")
+    if sync_history:
+        from llm_archive.sync import compact_history
+        directory = read_config().get("sync_directory")
+        if not directory:
+            raise click.ClickException("Sync is not configured. Use: llm-archive sync-init <private-git-url>")
+        try:
+            compact_history(Path(directory))
+        except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo("Replaced the journal history with one commit and pushed it.")
+
+
 @cli.group()
 def automation():
     """Enable hands-off capture, private sync, and Ghostty workspace recovery."""

@@ -507,21 +507,91 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT count(*) FROM conversation_revisions").fetchone()[0], 1)
             conn.close()
 
-    def test_sync_uses_compressed_per_session_records(self):
-        import gzip
-        self.codex_file()
+    def test_sync_writes_append_friendly_text_records(self):
+        path = self.codex_file()
         self.codex_file(name="another-session")
         ingest.run_ingest()
         root = self.root / "snapshot"
         conn = db.get_connection()
         records = sync.export_device(conn, root)
-        conn.close()
-        paths = list(records.glob("*.json.gz"))
+        paths = sorted(records.glob("*.jsonl"))
         self.assertEqual(len(paths), 2)
-        self.assertFalse((records.parent / "sessions.jsonl").exists())
-        with gzip.open(paths[0], "rt") as stream:
-            self.assertIn("messages", json.load(stream))
-        self.assertEqual(json.loads((root / sync.MARKER).read_text())["version"], 2)
+        self.assertFalse(list(records.glob("*.json.gz")))
+        before = {p: p.read_text() for p in paths}
+        conn.close()
+        self.message(path, "assistant", "Appended answer")
+        ingest.run_ingest()
+        conn = db.get_connection()
+        sync.export_device(conn, root)
+        conn.close()
+        changed = [p for p in paths if p.read_text() != before[p]]
+        self.assertEqual(len(changed), 1)
+        old, new = before[changed[0]].splitlines(), changed[0].read_text().splitlines()
+        # Only the session header and the new message differ, so Git stores a small delta.
+        self.assertEqual(len(set(new) - set(old)), 2)
+        self.assertEqual(json.loads((root / sync.MARKER).read_text())["version"], sync.FORMAT_VERSION)
+
+    def test_version_two_compressed_records_are_still_imported(self):
+        import gzip
+        self.codex_file()
+        ingest.run_ingest()
+        conn = db.get_connection()
+        record = db.conversation_record(conn, self.sessions()[0]["id"])
+        conn.close()
+        folder = self.root / "v2" / "devices" / "other" / "sessions"
+        folder.mkdir(parents=True)
+        (folder / "record.json.gz").write_bytes(gzip.compress(json.dumps(record).encode()))
+        with self.device("two"):
+            conn = db.get_connection()
+            self.assertEqual(sync.import_devices(conn, self.root / "v2"), 1)
+            conn.close()
+
+    def test_changing_directory_does_not_preserve_a_copy_and_prefix_copies_are_pruned(self):
+        path = self.codex_file()
+        ingest.run_ingest()
+        self.append(path, {"type": "session_meta", "payload": {
+            "id": "session-one", "cwd": str(self.root), "timestamp": db.utc_now()}})
+        self.message(path, "assistant", "Now elsewhere")
+        ingest.run_ingest()
+        conn = db.get_connection()
+        self.assertEqual(conn.execute("SELECT count(*) FROM conversation_revisions").fetchone()[0], 0)
+        cid = self.sessions()[0]["id"]
+        prefix = db.conversation_record(conn, cid)
+        prefix["messages"] = prefix["messages"][:1]
+        db.store_revision(conn, cid, prefix)
+        rewritten = dict(prefix, messages=[{"role": "user", "content": "Lost", "timestamp": "t"}])
+        db.store_revision(conn, cid, rewritten)
+        self.assertEqual(db.prune_redundant_revisions(conn), 1)
+        self.assertIn("Lost", conn.execute("SELECT snapshot FROM conversation_revisions").fetchone()[0])
+        conn.close()
+
+    def test_compacted_history_is_adopted_by_other_computers(self):
+        remote = self.root / "remote.git"
+        git(self.root, "init", "--bare", "--initial-branch=main", str(remote))
+        path = self.codex_file()
+        ingest.run_ingest()
+        one = sync.configure(str(remote))
+        sync.run_sync(one)
+        with self.device("two"):
+            two = sync.configure(str(remote))
+            self.codex_file(name="session-two")
+            ingest.run_ingest()
+            sync.run_sync(two)
+        sync.run_sync(one)
+        self.message(path, "assistant", "Before compaction")
+        ingest.run_ingest()
+        sync.run_sync(one)
+        sync.compact_history(one)
+        self.assertEqual(git(one, "rev-list", "--count", "HEAD"), "1")
+        self.assertEqual(git(remote, "rev-list", "--count", "main"), "1")
+        with self.device("two"):
+            self.codex_file(name="session-three")
+            ingest.run_ingest()
+            self.assertEqual(sync.run_sync(two), 1)
+            self.assertEqual(len(self.sessions()), 3)
+            self.assertEqual(git(two, "rev-list", "--count", "HEAD"), "2")
+        self.assertEqual(sync.run_sync(one), 1)
+        self.assertEqual(len(self.sessions()), 3)
 
     def test_legacy_jsonl_snapshots_are_still_imported(self):
         self.codex_file()

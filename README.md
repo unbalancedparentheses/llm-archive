@@ -145,9 +145,16 @@ llm-archive install-service
 
 Use an existing Git credential helper or an SSH key available without an interactive password prompt. Every checkpoint commits this computer's snapshot, fetches and imports other computers' updates, then pushes. You can also run `llm-archive sync` manually. Local capture continues when the remote is unavailable; the next checkpoint retries, and `status` reports the last successful sync and any error. Automated snapshot commits use the `llm-archive` identity and are unsigned.
 
-Each installation has a persistent device ID and owns a separate path in the sync repository. Sessions are stored as individual compressed `.json.gz` records, keeping Git objects small instead of rewriting one large combined archive. Exchanged records include stripped conversations, compact tool evidence, preserved transcript versions, named workspace definitions, project/session metadata, directory paths, and computer names. These records can contain sensitive conversation or command output: use a private repository. The source-code repository is not the sync destination. The SQLite database, embeddings, agent credentials, and agent configuration files are not uploaded. Sync is disabled until `sync-init` is run.
+Each installation has a persistent device ID and owns a separate path in the sync repository. Each session is a plain-text file with one line per message or tool event, so a growing session changes only a few lines and Git stores each checkpoint as a small delta. Preserved transcript versions are written once as compressed files and never rewritten. Exchanged records include stripped conversations, compact tool evidence, preserved transcript versions, named workspace definitions, project/session metadata, directory paths, and computer names. These records can contain sensitive conversation or command output: use a private repository. The source-code repository is not the sync destination. The SQLite database, embeddings, agent credentials, and agent configuration files are not uploaded. Sync is disabled until `sync-init` is run.
 
-Sync format version 2 can read older JSONL device snapshots and writes compressed session records. Upgrade the collector on every computer before using version 2; older collectors reject its format marker rather than silently overlooking new records.
+Sync format version 3 reads version 1 and 2 snapshots and writes the line-per-message records. Upgrade the collector on every computer before using version 3; older collectors reject its format marker rather than silently overlooking new records.
+
+```bash
+llm-archive compact                 # drop preserved versions that only repeat the current conversation
+llm-archive compact --sync-history  # also replace the journal's Git history with one commit (force-push)
+```
+
+`compact --sync-history` rewrites the private journal repository. Other computers notice the new history at their next checkpoint and regenerate their own records from their local databases.
 
 On each additional computer, install the same version of `llm-archive`, run `sync-init` with the same private remote, run `sync` to download existing context, and install the background service. Each computer then pulls and pushes at every checkpoint automatically. A repository existing on GitHub alone does not collect activity from computers without the collector installed.
 

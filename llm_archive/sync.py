@@ -16,9 +16,14 @@ from llm_archive.paths import atomic_write, collector_lock, data_dir, device_id,
 MARKER = "journal-format.json"
 
 
+# Packing can rewrite a large history; everything else should finish quickly.
+_TIMEOUTS = {"push": 180, "gc": 3600, "reflog": 600}
+
+
 def _git(root: Path, *args: str, check=True):
     result = subprocess.run(["git", "-C", str(root), *args], text=True, capture_output=True,
-                            timeout=180 if args and args[0] == "push" else 45, env=_git_environment())
+                            timeout=_TIMEOUTS.get(next((a for a in args if not a.startswith("-") and "=" not in a), ""), 45),
+                            env=_git_environment())
     if check and result.returncode:
         raise RuntimeError(f"Journal Git {' '.join(args[:2])} failed: {result.stderr.strip()}")
     return result
@@ -51,7 +56,7 @@ def configure(remote: str) -> Path:
     if (root / MARKER).exists():
         _check_format(root)
     else:
-        atomic_write(root / MARKER, json.dumps({"format": "llm-archive-journal", "version": 2}) + "\n")
+        atomic_write(root / MARKER, json.dumps({"format": "llm-archive-journal", "version": FORMAT_VERSION}) + "\n")
     config = read_config()
     config["sync_directory"] = str(root)
     atomic_write(data_dir() / "config.json", json.dumps(config, indent=2) + "\n")
@@ -60,33 +65,49 @@ def configure(remote: str) -> Path:
 
 def _check_format(root: Path):
     marker = json.loads((root / MARKER).read_text())
-    if marker.get("format") != "llm-archive-journal" or marker.get("version") not in (1, 2):
+    if marker.get("format") != "llm-archive-journal" or marker.get("version") not in (1, 2, FORMAT_VERSION):
         raise RuntimeError("Unsupported journal sync format")
 
 
+FORMAT_VERSION = 3
+
+
+def _line(kind: str, value: dict) -> str:
+    return json.dumps({kind: value}, ensure_ascii=False, sort_keys=True) + "\n"
+
+
 def export_device(conn, root: Path) -> Path:
+    """One plain-text line per message/event, so Git stores a growing session as a small delta.
+
+    Preserved versions are immutable and written once; rewriting compressed whole-session
+    files on every checkpoint grew the repository history by gigabytes a day.
+    """
     from llm_archive.workspaces import export_local
+    from llm_archive.paths import atomic_write_bytes
     folder = root / "devices" / device_id()
-    folder.mkdir(parents=True, exist_ok=True)
     records_dir = folder / "sessions"
-    records_dir.mkdir(exist_ok=True)
+    records_dir.mkdir(parents=True, exist_ok=True)
+    revisions_dir = folder / "revisions"
+    revisions_dir.mkdir(exist_ok=True)
     for row in conn.execute("SELECT * FROM conversations WHERE origin_device = ? ORDER BY session_id", (device_id(),)):
         cid = row["id"]
         record = db.conversation_record(conn, cid)
-        record["revisions"] = [json.loads(r[0]) for r in conn.execute(
-            "SELECT snapshot FROM conversation_revisions WHERE conversation_id = ? ORDER BY revision_key", (cid,))]
-        # Bound Git object size to one compressed session, not the entire archive.
-        name = hashlib.sha256(record["session_id"].encode()).hexdigest() + ".json.gz"
-        path = records_dir / name
-        encoded = json.dumps(record, ensure_ascii=False, sort_keys=True).encode()
-        compressed = gzip.compress(encoded, mtime=0)
-        if not path.exists() or path.read_bytes() != compressed:
-            from llm_archive.paths import atomic_write_bytes
-            atomic_write_bytes(path, compressed)
-    # The database is authoritative for this generated snapshot. Historical
-    # versions remain in records and previously published Git history.
+        messages, events = record.pop("messages"), record.pop("events")
+        text = (_line("session", record) + "".join(_line("message", m) for m in messages)
+                + "".join(_line("event", e) for e in events)).encode()
+        name = hashlib.sha256(record["session_id"].encode()).hexdigest()
+        path = records_dir / (name + ".jsonl")
+        if not path.exists() or path.read_bytes() != text:
+            atomic_write_bytes(path, text)
+        (records_dir / (name + ".json.gz")).unlink(missing_ok=True)
+        for key, snapshot in conn.execute("SELECT revision_key, snapshot FROM conversation_revisions "
+                                          "WHERE conversation_id = ?", (cid,)):
+            revision = revisions_dir / (key + ".json.gz")
+            if not revision.exists():
+                atomic_write_bytes(revision, gzip.compress(snapshot.encode(), mtime=0))
+    # The database is authoritative for this generated snapshot.
     (folder / "sessions.jsonl").unlink(missing_ok=True)
-    atomic_write(root / MARKER, json.dumps({"format": "llm-archive-journal", "version": 2}) + "\n")
+    atomic_write(root / MARKER, json.dumps({"format": "llm-archive-journal", "version": FORMAT_VERSION}) + "\n")
     workspaces_path = folder / "workspaces.json"
     workspace_text = json.dumps(export_local(), indent=2, sort_keys=True) + "\n"
     if not workspaces_path.exists() or workspaces_path.read_text() != workspace_text:
@@ -100,9 +121,25 @@ def _device_records(folder: Path):
         with legacy.open(encoding="utf-8") as stream:
             for line in stream:
                 yield json.loads(line)
+    revisions = {}
+    for path in sorted((folder / "revisions").glob("*.json.gz")):
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            snapshot = json.load(stream)
+        revisions.setdefault(snapshot.get("session_id"), []).append(snapshot)
     for path in sorted((folder / "sessions").glob("*.json.gz")):
         with gzip.open(path, "rt", encoding="utf-8") as stream:
             yield json.load(stream)
+    for path in sorted((folder / "sessions").glob("*.jsonl")):
+        record = {"messages": [], "events": []}
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                (kind, value), = json.loads(line).items()
+                if kind == "session":
+                    record.update(value)
+                else:
+                    record[kind + "s"].append(value)
+        record["revisions"] = revisions.get(record.get("session_id"), [])
+        yield record
 
 
 def import_devices(conn, root: Path) -> int:
@@ -152,21 +189,59 @@ def sync_if_configured() -> int:
     return run_sync(Path(config["sync_directory"]))
 
 
+def _commit_export(conn, root: Path, message="Checkpoint work journal"):
+    export_device(conn, root)
+    _git(root, "add", "-A", "--", MARKER, f"devices/{device_id()}")
+    if _git(root, "diff", "--cached", "--quiet", check=False).returncode:
+        _git(root, "-c", "user.name=llm-archive", "-c", "user.email=llm-archive@localhost",
+             "commit", "-m", message)
+
+
+def compact_history(root: Path) -> None:
+    """Replace the journal history with one commit of the current files and publish it."""
+    with collector_lock():
+        conn = db.get_connection()
+        try:
+            _check_format(root)
+            _git(root, "fetch", "origin")
+            branch = _git(root, "branch", "--show-current").stdout.strip()
+            remote_ref = f"refs/remotes/origin/{branch}"
+            if _git(root, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode == 0:
+                # Keep other computers' newest records; this device's folder is regenerated below.
+                _git(root, "reset", "--hard", remote_ref)
+                lease = _git(root, "rev-parse", remote_ref).stdout.strip()
+            else:
+                lease = ""
+            export_device(conn, root)
+            _git(root, "checkout", "--orphan", "llm-archive-compact")
+            _git(root, "add", "-A")
+            _git(root, "-c", "user.name=llm-archive", "-c", "user.email=llm-archive@localhost",
+                 "commit", "-m", "Compact work journal history")
+            _git(root, "branch", "-M", branch)
+            _git(root, "push", f"--force-with-lease={branch}:{lease}", "-u", "origin", branch)
+            _git(root, "reflog", "expire", "--expire=now", "--all")
+            _git(root, "gc", "--prune=now", "--quiet")
+        finally:
+            conn.close()
+
+
 def run_sync(root: Path) -> int:
     with collector_lock():
         conn = db.get_connection()
         try:
             _check_format(root)
-            export_device(conn, root)
-            _git(root, "add", "--", MARKER, f"devices/{device_id()}")
-            if _git(root, "diff", "--cached", "--quiet", check=False).returncode:
-                _git(root, "-c", "user.name=llm-archive", "-c", "user.email=llm-archive@localhost",
-                     "commit", "-m", "Checkpoint work journal")
+            _commit_export(conn, root)
             # Each device owns a separate path. Rebase unpushed checkpoints after
             # fetching other machines; never force-push or reset local history.
             _git(root, "fetch", "origin")
             branch = _git(root, "branch", "--show-current").stdout.strip()
             remote_ref = f"refs/remotes/origin/{branch}"
+            if (_git(root, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode == 0
+                    and _git(root, "merge-base", "HEAD", remote_ref, check=False).returncode):
+                # Another computer compacted the history. This device's folder is regenerated
+                # from its database, so adopt the new history and export again.
+                _git(root, "reset", "--hard", remote_ref)
+                _commit_export(conn, root)
             if _git(root, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode == 0:
                 rebased = _git(root, "rebase", remote_ref, check=False)
                 if rebased.returncode:
@@ -175,6 +250,8 @@ def run_sync(root: Path) -> int:
             imported = import_devices(conn, root)
             conn.commit()
             _git(root, "push", "-u", "origin", branch)
+            # Pack loose checkpoint objects as deltas before they pile up.
+            _git(root, "-c", "gc.auto=200", "gc", "--auto", "--quiet", check=False)
             db.set_state(conn, "last_sync", db.utc_now())
             db.set_state(conn, "sync_error", "")
             conn.commit()

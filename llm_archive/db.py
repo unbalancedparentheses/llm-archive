@@ -119,6 +119,24 @@ def store_revision(conn, conv_id: int, snapshot: dict) -> str:
     return key
 
 
+def is_prefix(snapshot: dict, current: dict) -> bool:
+    return all(snapshot.get(k, []) == current[k][:len(snapshot.get(k, []))] for k in ("messages", "events"))
+
+
+def prune_redundant_revisions(conn) -> int:
+    """A version that is an earlier prefix of the current conversation preserves nothing."""
+    pruned = 0
+    for (conv_id,) in conn.execute("SELECT DISTINCT conversation_id FROM conversation_revisions").fetchall():
+        current = conversation_record(conn, conv_id)
+        for key, snapshot in conn.execute("SELECT revision_key, snapshot FROM conversation_revisions "
+                                          "WHERE conversation_id = ?", (conv_id,)).fetchall():
+            if is_prefix(json.loads(snapshot), current):
+                conn.execute("DELETE FROM conversation_revisions WHERE revision_key = ?", (key,))
+                pruned += 1
+    conn.commit()
+    return pruned
+
+
 def revisions(conn, project: str, session_id: str | None = None) -> list[dict]:
     sql = """SELECT r.*, c.project, c.source, c.session_id FROM conversation_revisions r
              JOIN conversations c ON c.id = r.conversation_id WHERE (c.project = ? OR c.project_key = ?)"""
@@ -158,9 +176,9 @@ def upsert_conversation(conn, conv: ParsedConversation, metadata: dict | None = 
         previous_messages = [(m["role"], m["content"], m["timestamp"]) for m in before["messages"]]
         incoming_messages = [(m.role, m.content, m.timestamp) for m in conv.messages]
         incoming_events = [dict(event_id=e.event_id, kind=e.kind, content=e.content, timestamp=e.timestamp) for e in conv.events]
+        # Only a rewrite loses content; an agent changing directory just updates metadata.
         changed_history = (previous_messages != incoming_messages[:len(previous_messages)] or
-                           before["events"] != incoming_events[:len(before["events"])] or
-                           (before.get("cwd") and before["cwd"] != info.get("cwd", conv.cwd)))
+                           before["events"] != incoming_events[:len(before["events"])])
         if changed_history:
             store_revision(conn, conv_id, before)
         # Truncating a source must not make this session disappear from recent activity.
