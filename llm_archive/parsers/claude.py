@@ -5,8 +5,9 @@ from pathlib import Path
 
 from llm_archive.parsers import ParsedConversation, ParsedMessage, normalize_project
 from llm_archive.strip import strip_code_blocks
+from llm_archive.parsers.events import tool_event, result_event
 
-CLAUDE_BASE = Path.home() / ".claude" / "projects"
+CLAUDE_BASE = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser() / "projects"
 
 
 def _extract_project(folder_name: str) -> str:
@@ -59,13 +60,18 @@ def parse_claude_sessions() -> Iterator[ParsedConversation]:
 
 def _parse_session(path: Path, project: str) -> ParsedConversation | None:
     messages = []
+    events = []
+    cwd = ""
+    is_subagent = "subagents" in path.parts
     session_id = path.stem
     git_branch = None
     started_at = None
 
     try:
-        with open(path) as f:
-            for line in f:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for index, line in enumerate(f):
+                if not line.endswith("\n"):
+                    continue
                 line = line.strip()
                 if not line:
                     continue
@@ -73,20 +79,33 @@ def _parse_session(path: Path, project: str) -> ParsedConversation | None:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(obj, dict):
+                    continue
 
                 msg_type = obj.get("type", "")
                 if msg_type not in ("user", "assistant"):
                     continue
+                cwd = obj.get("cwd") or cwd
+                is_subagent = is_subagent or bool(obj.get("isSidechain"))
 
-                if git_branch is None:
-                    git_branch = obj.get("gitBranch")
+                git_branch = obj.get("gitBranch") or git_branch
                 if started_at is None:
                     started_at = obj.get("timestamp")
 
-                if msg_type == "user" and obj.get("sessionId"):
+                if not is_subagent and obj.get("sessionId"):
                     session_id = obj["sessionId"]
 
                 msg = obj.get("message", {})
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for block_index, block in enumerate(content):
+                        if not isinstance(block, dict):
+                            continue
+                        eid = block.get("id", f"{index}:{block_index}")
+                        if block.get("type") == "tool_use":
+                            events.append(tool_event(eid, block.get("name", "tool"), block.get("input", {}), obj.get("timestamp", "")))
+                        elif block.get("type") == "tool_result":
+                            events.append(result_event(block.get("tool_use_id", eid), block.get("content", ""), obj.get("timestamp", "")))
                 role = msg.get("role", msg_type)
                 raw_text = _extract_text(msg.get("content", ""))
                 text = strip_code_blocks(raw_text)
@@ -109,4 +128,8 @@ def _parse_session(path: Path, project: str) -> ParsedConversation | None:
         git_branch=git_branch,
         started_at=started_at,
         messages=messages,
+        cwd=cwd,
+        source_path=str(path.resolve()),
+        is_subagent=is_subagent,
+        events=events,
     )

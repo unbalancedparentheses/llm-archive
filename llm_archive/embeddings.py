@@ -1,13 +1,13 @@
 """Semantic embedding and search using ollama or sentence-transformers."""
 import json
 import subprocess
-from pathlib import Path
 
 import numpy as np
 
 from llm_archive import db
+from llm_archive.paths import data_dir
 
-EMBEDDINGS_DIR = Path.home() / ".local" / "share" / "llm-archive"
+EMBEDDINGS_DIR = data_dir()
 EMBEDDINGS_PATH = EMBEDDINGS_DIR / "embeddings.npz"
 META_PATH = EMBEDDINGS_DIR / "embeddings_meta.json"
 
@@ -162,6 +162,14 @@ def semantic_search(
     existing_ids, existing_emb, meta = _load_existing()
     if existing_ids is None or meta is None:
         raise RuntimeError("No embeddings found. Run: llm-archive embed")
+
+    # Refreshed transcripts may remove messages. Stale vectors must not crowd
+    # current messages out of the candidate set.
+    live_ids = set(db.all_message_ids(conn))
+    mask = np.array([int(mid) in live_ids for mid in existing_ids], dtype=bool)
+    existing_ids, existing_emb = existing_ids[mask], existing_emb[mask]
+    if not len(existing_ids):
+        return []
 
     provider = meta["provider"]
     # Verify provider is still available

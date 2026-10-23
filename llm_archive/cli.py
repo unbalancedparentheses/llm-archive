@@ -1,6 +1,9 @@
 import os
 import platform
 import subprocess
+import sys
+import json
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,7 +16,9 @@ from llm_archive.ingest import run_ingest
 MAX_GAP = timedelta(minutes=30)
 
 
-def _check_scheduler():
+def _check_scheduler(show_db=True):
+    if not sys.stdout.isatty():
+        return
     system = platform.system()
     if system == "Darwin":
         result = subprocess.run(
@@ -39,7 +44,9 @@ def _check_scheduler():
             else:
                 click.secho("auto-ingest: not installed (run: llm-archive install-cron)", fg="yellow")
 
-    db_path = Path.home() / ".local" / "share" / "llm-archive" / "archive.db"
+    if not show_db:
+        return
+    db_path = db.DB_PATH
     if db_path.exists():
         mtime = datetime.fromtimestamp(db_path.stat().st_mtime)
         age = datetime.now() - mtime
@@ -53,16 +60,22 @@ def _check_scheduler():
 
 
 @click.group()
-def cli():
+@click.pass_context
+def cli(ctx):
     """Ingest, search, and analyze LLM conversations."""
-    _check_scheduler()
+    if ctx.invoked_subcommand != "status":
+        _check_scheduler()
 
 
 @cli.command()
-def ingest():
+@click.option("--force", is_flag=True, help="Reparse all files, including unchanged ones")
+def ingest(force):
     """Ingest conversations from Claude Code and Codex CLI."""
-    new_convs, new_msgs = run_ingest()
-    click.echo(f"Ingested {new_convs} conversations ({new_msgs} messages)")
+    try:
+        new_convs, new_msgs = run_ingest(force=force)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Updated {new_convs} conversations ({new_msgs} new or refreshed messages)")
 
 
 @cli.command()
@@ -342,7 +355,7 @@ def summarize(days):
     click.echo(summary)
 
     # Save to markdown file
-    summaries_dir = Path.home() / ".local" / "share" / "llm-archive" / "summaries"
+    summaries_dir = db.DB_DIR / "summaries"
     summaries_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     md_path = summaries_dir / f"{today}.md"
@@ -378,7 +391,7 @@ def ideas(days, project):
     click.echo(result)
 
     # Save to file
-    ideas_dir = Path.home() / ".local" / "share" / "llm-archive" / "ideas"
+    ideas_dir = db.DB_DIR / "ideas"
     ideas_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     md_path = ideas_dir / f"{today}.md"
@@ -417,16 +430,19 @@ def recurring(days, threshold, min_count):
 
 
 @cli.command(name="install-cron")
-def install_cron():
-    """Set up daily automatic ingestion (launchd/systemd/crontab)."""
+@click.option("--interval", default=120, type=click.IntRange(min=60), show_default=True, help="Seconds between checkpoints")
+def install_cron(interval):
+    """Install periodic capture, handoffs, and configured sync (also: install-service)."""
     from llm_archive.scheduler import install
-    result = install()
-    click.echo(result)
+    try:
+        click.echo(install(interval=interval))
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @cli.command(name="uninstall-cron")
 def uninstall_cron():
-    """Remove daily automatic ingestion."""
+    """Remove automatic checkpoints (also: uninstall-service)."""
     from llm_archive.scheduler import uninstall
     result = uninstall()
     click.echo(result)
@@ -564,3 +580,363 @@ def stats():
     click.echo("\nTop projects:")
     for row in s["by_project"]:
         click.echo(f"  {row['project']}: {row['convs']} conversations")
+
+
+@cli.command()
+@click.option("--no-sync", is_flag=True, help="Capture locally without contacting the configured sync remote")
+def checkpoint(no_sync):
+    """Capture changed sessions, write handoffs, and sync if configured."""
+    from llm_archive.journal import checkpoint as capture
+    try:
+        updated, messages, projects = capture(sync=not no_sync)
+    except (RuntimeError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"{db.utc_now()}: checked sessions; updated {updated} conversations, {messages} messages, {projects} project handoffs.")
+
+
+@cli.command()
+@click.option("--interval", default=120, type=click.IntRange(min=60), show_default=True)
+def watch(interval):
+    """Run checkpoints in the foreground until Ctrl-C."""
+    from llm_archive.journal import checkpoint as capture
+    try:
+        while True:
+            try:
+                updated, messages, projects = capture()
+                click.echo(f"{db.utc_now()}: {updated} sessions updated; {projects} project handoffs.")
+            except (OSError, RuntimeError, ValueError) as exc:
+                click.echo(f"{db.utc_now()}: {exc}", err=True)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+
+
+@cli.command()
+@click.option("--days", default=7, type=click.IntRange(min=1), show_default=True)
+@click.option("--project", default=None, help="Project name or repository identity")
+@click.option("--limit", default=20, type=click.IntRange(min=1), show_default=True)
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable status and recent sessions")
+@click.option("--sessions", "show_sessions", is_flag=True, help="Show individual sessions instead of grouping by project")
+def status(days, project, limit, as_json, show_sessions):
+    """See capture/sync health and recent work across projects and computers."""
+    from llm_archive.journal import recent_sessions
+    from llm_archive.paths import read_config
+    from llm_archive.overview import display_time, project_overview, session_summary
+    from llm_archive.recovery import read_state
+    recovery = {"enabled": bool(read_config().get("automatic_recovery")), **read_state()}
+    conn = db.get_connection()
+    try:
+        state = db.get_state(conn)
+        sessions = recent_sessions(conn, days=days, project=project, limit=10000)
+        projects = project_overview(conn, sessions)[:limit]
+        details = [{**s, **session_summary(conn, s)} for s in sessions[:limit]] if show_sessions else []
+    finally:
+        conn.close()
+    if as_json:
+        click.echo(json.dumps({"collector": state, "sync_configured": bool(read_config().get("sync_directory")), "recovery": recovery,
+                               "projects": projects, "sessions": details if show_sessions else sessions[:limit]}, indent=2))
+        return
+    _check_scheduler(show_db=False)
+    click.echo(f"Last check:      {display_time(state.get('last_check'))}")
+    click.echo(f"Last successful: {display_time(state.get('last_success'))}")
+    click.echo(f"Last sync:       {display_time(state.get('last_sync')) if read_config().get('sync_directory') else 'not configured'}")
+    if recovery["enabled"]:
+        click.echo(f"Auto recovery:   enabled · {recovery.get('saved_tabs', 0)} tabs / {recovery.get('resumable_tabs', 0)} agent sessions")
+        click.echo(f"Workspace saved: {display_time(recovery.get('last_capture'))}")
+        click.echo(f"Recovery check:  {display_time(recovery.get('last_check'))}")
+        if recovery.get("unknown_directories"):
+            click.echo(f"  {recovery['unknown_directories']} shell tabs have no reported directory and cannot yet be restored.")
+        if recovery.get("error"):
+            click.secho(f"recovery_error: {recovery['error']}", fg="yellow")
+    for key in ("capture_error", "sync_error"):
+        if state.get(key):
+            click.secho(f"{key}: {state[key]}", fg="yellow")
+    click.echo()
+    for p in details if show_sessions else projects:
+        if show_sessions:
+            click.secho(f"{p['project']}  [{p['source']}]  {p.get('git_branch') or ''}  {p['session_id']}", bold=True)
+            click.echo(f"  {display_time(p.get('last_activity') or p['started_at'])} · {p.get('machine') or 'unknown computer'}")
+            click.echo(f"  {p.get('cwd') or 'directory not recorded'}")
+        else:
+            click.secho(f"{p['project']}  · {p['session_count']} sessions · {', '.join(p['sources'])}", bold=True)
+            click.echo(f"  {display_time(p['last_activity'])}")
+        click.echo(f"  Task: {p['task']}")
+        click.echo(f"  Update: {p['last_update']}")
+        click.echo(f"  Next (reported): {p['next_step']}")
+        click.echo()
+    if not sessions:
+        click.echo("No recent sessions. Run llm-archive checkpoint to capture existing history.")
+
+
+@cli.command()
+@click.argument("project")
+@click.option("--session", "session_id", help="Only versions of this session")
+@click.option("--revision", help="Print a previous version by its key or unique prefix")
+@click.option("--output", type=click.Path(path_type=Path), help="Save the selected version as JSON")
+def history(project, session_id, revision, output):
+    """Inspect preserved versions of rewritten or truncated transcripts."""
+    from llm_archive.overview import display_time
+    from llm_archive.paths import atomic_write
+    conn = db.get_connection()
+    try:
+        records = db.revisions(conn, project, session_id)
+    finally:
+        conn.close()
+    if revision:
+        matches = [r for r in records if r["revision_key"].startswith(revision)]
+        if len(matches) != 1:
+            raise click.ClickException("Revision not found or prefix is ambiguous.")
+        text = json.dumps(json.loads(matches[0]["snapshot"]), indent=2, ensure_ascii=False)
+        if output:
+            atomic_write(output, text + "\n")
+            click.echo(f"Saved preserved version to {output}")
+        else:
+            click.echo(text)
+        return
+    if output:
+        raise click.ClickException("Use --revision when saving a version.")
+    for r in records:
+        snapshot = json.loads(r["snapshot"])
+        click.echo(f"{r['revision_key'][:12]}  {display_time(r['captured_at'])}  [{r['source']}] {r['session_id']}  {len(snapshot['messages'])} messages")
+    if not records:
+        click.echo("No previous versions recorded; existing captured versions are preserved when a transcript is rewritten.")
+
+
+@cli.command()
+@click.argument("project")
+@click.option("--days", default=30, type=click.IntRange(min=1), show_default=True)
+@click.option("--session", "session_id", default=None, help="Limit the handoff to a session ID")
+@click.option("--output", type=click.Path(path_type=Path), help="Write a portable Markdown handoff")
+def resume(project, days, session_id, output):
+    """Print the latest context and continuation commands for PROJECT."""
+    from llm_archive.journal import handoff, recent_sessions
+    from llm_archive.paths import atomic_write
+    conn = db.get_connection()
+    try:
+        sessions = recent_sessions(conn, days=days, project=project, limit=10000)
+        if session_id:
+            sessions = [s for s in sessions if s["session_id"] == session_id]
+        if not sessions:
+            raise click.ClickException("No matching activity. Run checkpoint or increase --days.")
+        text = handoff(conn, sessions[:5])
+    finally:
+        conn.close()
+    if output:
+        atomic_write(output, text)
+        click.echo(f"Saved handoff to {output}")
+    else:
+        click.echo(text)
+
+
+@cli.command()
+@click.option("--days", default=3, type=click.IntRange(min=1), show_default=True)
+@click.option("--project", default=None, help="Only reopen this project")
+@click.option("--limit", default=10, type=click.IntRange(min=1), show_default=True, help="Maximum directories to reopen")
+@click.option("--resume", "resume_agents", is_flag=True, help="Resume the latest local agent session in each directory")
+@click.option("--projects-root", type=click.Path(exists=True, file_okay=False, path_type=Path), help="Find local checkouts under this directory on another computer")
+@click.option("--dry-run", is_flag=True, help="Preview tabs and commands without opening Ghostty")
+@click.option("--session", "session_id", help="Choose a specific session instead of the latest in its directory")
+@click.option("--workspace", "workspace_name", help="Restore a saved workspace")
+@click.option("--new-tabs", is_flag=True, help="Open additional tabs even for directories already open in Ghostty")
+def reopen(days, project, limit, resume_agents, projects_root, dry_run, session_id, workspace_name, new_tabs):
+    """Restore recent project/worktree directories as Ghostty tabs (macOS)."""
+    from llm_archive.journal import recent_sessions
+    from llm_archive.terminal import open_ghostty, reopen_plan, ghostty_directories
+    conn = db.get_connection()
+    try:
+        if workspace_name:
+            from llm_archive.workspaces import load
+            sessions = load(workspace_name)["sessions"]
+            if project:
+                sessions = [s for s in sessions if s["project"] == project or s.get("project_key") == project]
+        else:
+            sessions = recent_sessions(conn, days=36500 if session_id else days, project=project, limit=10000)
+        if session_id:
+            sessions = [s for s in sessions if s["session_id"] == session_id]
+            if not sessions:
+                raise ValueError("Session not found; use llm-archive status --sessions to choose an ID.")
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        conn.close()
+    plan = reopen_plan(sessions, resume=resume_agents, projects_root=projects_root)[:limit]
+    for p in plan:
+        p["new_tab"] = new_tabs
+    if not plan:
+        click.echo("No recent project directories. Run checkpoint or increase --days.")
+        return
+    existing = set()
+    if dry_run and not new_tabs and platform.system() == "Darwin":
+        try:
+            existing = ghostty_directories()
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            click.echo(f"Existing tabs could not be inspected: {exc}", err=True)
+    for p in plan:
+        click.echo(f"{p['project']}: {p['cwd'] or 'skipped'}")
+        if p["cwd"] in existing:
+            click.echo("  Already open; will be skipped (use --new-tabs to open another).")
+        if p["command"]:
+            click.echo(f"  {p['command']}")
+        if p["note"]:
+            click.echo(f"  {p['note']}")
+    if dry_run:
+        return
+    try:
+        click.echo(f"Opened {open_ghostty(plan)} Ghostty tabs.")
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.group()
+def workspace():
+    """Save and inspect named project workspaces."""
+
+
+@workspace.command(name="save")
+@click.argument("name")
+@click.option("--days", default=3, type=click.IntRange(min=1), show_default=True)
+@click.option("--project", "projects", multiple=True, help="Include only these projects (repeatable)")
+@click.option("--from-tabs", is_flag=True, help="Save the directories currently open in Ghostty")
+def workspace_save(name, days, projects, from_tabs):
+    from llm_archive.journal import recent_sessions
+    from llm_archive.workspaces import save
+    from llm_archive.terminal import ghostty_directories
+    conn = db.get_connection()
+    try:
+        sessions = recent_sessions(conn, days=days, limit=10000)
+        if projects:
+            sessions = [s for s in sessions if s["project"] in projects or s.get("project_key") in projects]
+        directories = ghostty_directories() if from_tabs else None
+        if directories is not None and projects:
+            directories &= {str(Path(s["cwd"]).resolve()) for s in sessions if s.get("cwd")}
+        record = save(name, sessions, directories=directories)
+    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        conn.close()
+    click.echo(f"Saved {len(record['sessions'])} directories as {name}. Restore with: llm-archive reopen --workspace {name}")
+
+
+@workspace.command(name="list")
+def workspace_list():
+    from llm_archive.workspaces import list_workspaces
+    from llm_archive.overview import display_time
+    records = list_workspaces()
+    for record in records:
+        click.echo(f"{record['selector']}  {len(record['sessions'])} directories  {display_time(record['saved_at'])}")
+    if not records:
+        click.echo("No saved workspaces. Use: llm-archive workspace save NAME")
+
+
+@cli.command(name="sync-init")
+@click.argument("remote")
+def sync_init(remote):
+    """Connect a dedicated private Git repository for journal data."""
+    from llm_archive.sync import configure
+    try:
+        root = configure(remote)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Journal sync configured: {root}\nRun llm-archive sync to exchange records now; checkpoints will sync automatically.")
+
+
+@cli.command()
+def sync():
+    """Exchange journal records with the configured private Git remote."""
+    from llm_archive.sync import sync_if_configured
+    from llm_archive.paths import read_config
+    if not read_config().get("sync_directory"):
+        raise click.ClickException("Sync is not configured. Use: llm-archive sync-init <private-git-url>")
+    try:
+        count = sync_if_configured()
+    except (RuntimeError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Synced journal; imported {count} session updates.")
+
+
+@cli.command()
+@click.option("--sync-history", is_flag=True,
+              help="Also replace the private journal's Git history with one commit and force-push it.")
+def compact(sync_history):
+    """Drop preserved versions that only repeat the current conversation, and shrink storage."""
+    from llm_archive.paths import collector_lock, read_config
+    with collector_lock():
+        conn = db.get_connection()
+        try:
+            pruned = db.prune_redundant_revisions(conn)
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+    click.echo(f"Removed {pruned} preserved versions that repeated the current conversation.")
+    if sync_history:
+        from llm_archive.sync import compact_history
+        directory = read_config().get("sync_directory")
+        if not directory:
+            raise click.ClickException("Sync is not configured. Use: llm-archive sync-init <private-git-url>")
+        try:
+            compact_history(Path(directory))
+        except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo("Replaced the journal history with one commit and pushed it.")
+
+
+@cli.group()
+def automation():
+    """Enable hands-off capture, private sync, and Ghostty workspace recovery."""
+
+
+@automation.command(name="enable")
+def automation_enable():
+    """Install capture/sync plus automatic live-tab saving and agent recovery (macOS)."""
+    from llm_archive.recovery import enable
+    try:
+        for message in enable():
+            click.echo(message)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@automation.command(name="disable")
+def automation_disable():
+    """Stop automatic tab saving/recovery; keep background capture and sync."""
+    from llm_archive.recovery import disable
+    try:
+        click.echo(disable())
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@automation.command(name="status")
+def automation_status():
+    """Show workspace recovery health without opening Ghostty."""
+    from llm_archive.paths import read_config
+    from llm_archive.recovery import read_state
+    click.echo(json.dumps({"enabled": bool(read_config().get("automatic_recovery")), **read_state()}, indent=2))
+
+
+@automation.command(name="recover")
+@click.option("--dry-run", is_flag=True, help="Preview recovery without opening tabs")
+def automation_recover(dry_run):
+    """Retry the automatic workspace after a recovery error, skipping running agents."""
+    from llm_archive.recovery import recover
+    try:
+        plan = recover(dry_run=dry_run)
+        click.echo(json.dumps(plan, indent=2))
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.command(name="recovery-watch", hidden=True)
+def recovery_watch():
+    """Internal foreground observer managed by launchd."""
+    from llm_archive.recovery import run
+    try:
+        run()
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    except KeyboardInterrupt:
+        pass
+
+
+cli.add_command(install_cron, "install-service")
+cli.add_command(uninstall_cron, "uninstall-service")

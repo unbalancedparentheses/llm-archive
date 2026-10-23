@@ -1,9 +1,13 @@
 import sqlite3
-from pathlib import Path
+import hashlib
+import json
+from datetime import datetime, timezone
 
 from llm_archive.parsers import ParsedConversation
+from llm_archive.paths import data_dir, machine_name, device_id
+from llm_archive.projects import repository
 
-DB_DIR = Path.home() / ".local" / "share" / "llm-archive"
+DB_DIR = data_dir()
 DB_PATH = DB_DIR / "archive.db"
 
 _SCHEMA = """
@@ -24,6 +28,8 @@ CREATE TABLE IF NOT EXISTS messages (
     timestamp TEXT
 );
 
+CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
     content=messages,
@@ -38,17 +44,169 @@ CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content)
     VALUES ('delete', old.id, old.content);
 END;
+
+CREATE TABLE IF NOT EXISTS source_files (
+    path TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collector_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS events (
+    conversation_id INTEGER REFERENCES conversations(id),
+    event_id TEXT,
+    kind TEXT,
+    content TEXT,
+    timestamp TEXT,
+    PRIMARY KEY (conversation_id, event_id)
+);
+CREATE TABLE IF NOT EXISTS conversation_revisions (
+    revision_key TEXT PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+    captured_at TEXT NOT NULL,
+    snapshot TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS revisions_conversation_idx ON conversation_revisions(conversation_id, captured_at);
 """
 
 
 def get_connection() -> sqlite3.Connection:
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)
     conn.row_factory = sqlite3.Row
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(conversations)")}
+    for name, declaration in {
+        "cwd": "TEXT", "repo_root": "TEXT", "project_key": "TEXT", "repo_url": "TEXT",
+        "machine": "TEXT", "source_path": "TEXT", "last_activity": "TEXT",
+        "collected_at": "TEXT", "is_subagent": "INTEGER DEFAULT 0", "origin_device": "TEXT",
+    }.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE conversations ADD COLUMN {name} {declaration}")
+    conn.commit()
     return conn
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def set_state(conn, key: str, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO collector_state VALUES (?, ?)", (key, value))
+
+
+def get_state(conn) -> dict:
+    return dict(conn.execute("SELECT key, value FROM collector_state"))
+
+
+def conversation_record(conn, conv_id: int) -> dict:
+    record = dict(conn.execute("SELECT * FROM conversations WHERE id = ?", (conv_id,)).fetchone())
+    record.pop("id")
+    record["messages"] = [dict(m) for m in conn.execute(
+        "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id", (conv_id,))]
+    record["events"] = [dict(e) for e in conn.execute(
+        "SELECT event_id, kind, content, timestamp FROM events WHERE conversation_id = ? ORDER BY rowid", (conv_id,))]
+    return record
+
+
+def store_revision(conn, conv_id: int, snapshot: dict) -> str:
+    """Historical payloads are immutable and content-addressed; repeated imports deduplicate."""
+    serialized = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    key = hashlib.sha256(serialized.encode()).hexdigest()
+    conn.execute("INSERT OR IGNORE INTO conversation_revisions VALUES (?, ?, ?, ?)",
+                 (key, conv_id, snapshot.get("collected_at") or utc_now(), serialized))
+    return key
+
+
+def is_prefix(snapshot: dict, current: dict) -> bool:
+    return all(snapshot.get(k, []) == current[k][:len(snapshot.get(k, []))] for k in ("messages", "events"))
+
+
+def prune_redundant_revisions(conn) -> int:
+    """A version that is an earlier prefix of the current conversation preserves nothing."""
+    pruned = 0
+    for (conv_id,) in conn.execute("SELECT DISTINCT conversation_id FROM conversation_revisions").fetchall():
+        current = conversation_record(conn, conv_id)
+        for key, snapshot in conn.execute("SELECT revision_key, snapshot FROM conversation_revisions "
+                                          "WHERE conversation_id = ?", (conv_id,)).fetchall():
+            if is_prefix(json.loads(snapshot), current):
+                conn.execute("DELETE FROM conversation_revisions WHERE revision_key = ?", (key,))
+                pruned += 1
+    conn.commit()
+    return pruned
+
+
+def revisions(conn, project: str, session_id: str | None = None) -> list[dict]:
+    sql = """SELECT r.*, c.project, c.source, c.session_id FROM conversation_revisions r
+             JOIN conversations c ON c.id = r.conversation_id WHERE (c.project = ? OR c.project_key = ?)"""
+    args = [project, project]
+    if session_id:
+        sql += " AND c.session_id = ?"
+        args.append(session_id)
+    return [dict(row) for row in conn.execute(sql + " ORDER BY r.captured_at DESC", args)]
+
+
+def upsert_conversation(conn, conv: ParsedConversation, metadata: dict | None = None) -> tuple[bool, int]:
+    """Refresh growing transcripts, preserving IDs for unchanged messages/embeddings."""
+    info = metadata if metadata is not None else {
+        **repository(conv.cwd, conv.repo_url), "machine": machine_name(), "source_path": conv.source_path,
+        "collected_at": utc_now(), "is_subagent": int(conv.is_subagent), "origin_device": device_id(),
+    }
+    activity = max([m.timestamp for m in conv.messages] + [e.timestamp for e in conv.events] + [conv.started_at or ""])
+    columns = ["source", "project", "git_branch", "started_at", "cwd", "repo_root", "project_key",
+               "repo_url", "machine", "source_path", "last_activity", "collected_at", "is_subagent", "origin_device"]
+    project = info.get("project") or conv.project
+    if not conv.cwd and metadata is None:
+        project = conv.project
+    values = [conv.source, project, conv.git_branch, conv.started_at,
+              info.get("cwd", conv.cwd), info.get("repo_root", ""), info.get("project_key", ""),
+              info.get("repo_url", ""), info.get("machine", ""), info.get("source_path", ""), activity,
+              info.get("collected_at", utc_now()), int(info.get("is_subagent", conv.is_subagent)), info.get("origin_device", "")]
+    existing = conn.execute("SELECT * FROM conversations WHERE session_id = ?", (conv.session_id,)).fetchone()
+    if (existing and existing["project_key"] and not existing["project_key"].startswith("directory:")
+            and values[columns.index("project_key")].startswith("directory:")
+            and existing["cwd"] == values[columns.index("cwd")]):
+        # The checkout was deleted after capture; keep the repository found while it existed.
+        for column in ("project", "repo_root", "project_key", "repo_url"):
+            values[columns.index(column)] = existing[column]
+    if existing:
+        conv_id = existing["id"]
+        before = conversation_record(conn, conv_id)
+        previous_messages = [(m["role"], m["content"], m["timestamp"]) for m in before["messages"]]
+        incoming_messages = [(m.role, m.content, m.timestamp) for m in conv.messages]
+        incoming_events = [dict(event_id=e.event_id, kind=e.kind, content=e.content, timestamp=e.timestamp) for e in conv.events]
+        # Only a rewrite loses content; an agent changing directory just updates metadata.
+        changed_history = (previous_messages != incoming_messages[:len(previous_messages)] or
+                           before["events"] != incoming_events[:len(before["events"])])
+        if changed_history:
+            store_revision(conn, conv_id, before)
+        # Truncating a source must not make this session disappear from recent activity.
+        values[columns.index("last_activity")] = max(activity, before.get("last_activity") or "")
+        conn.execute("UPDATE conversations SET " + ", ".join(f"{c} = ?" for c in columns) + " WHERE id = ?",
+                     [*values, conv_id])
+    else:
+        cur = conn.execute("INSERT INTO conversations (session_id, " + ", ".join(columns) + ") VALUES (" +
+                           ",".join("?" for _ in range(len(values) + 1)) + ")", [conv.session_id, *values])
+        conv_id = cur.lastrowid
+    old = conn.execute("SELECT id, role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id", (conv_id,)).fetchall()
+    prefix = 0
+    for row, msg in zip(old, conv.messages):
+        if tuple(row)[1:] != (msg.role, msg.content, msg.timestamp):
+            break
+        prefix += 1
+    # Never recycle an ID whose semantic embedding may already exist on disk.
+    max_id = conn.execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0]
+    watermark = conn.execute("SELECT value FROM collector_state WHERE key = 'message_id_watermark'").fetchone()
+    next_id = max(max_id, int(watermark[0]) if watermark else 0) + 1
+    conn.executemany("DELETE FROM messages WHERE id = ?", [(r[0],) for r in old[prefix:]])
+    conn.executemany("INSERT INTO messages (id, conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+                     [(next_id + i, conv_id, m.role, m.content, m.timestamp) for i, m in enumerate(conv.messages[prefix:])])
+    set_state(conn, "message_id_watermark", str(max(next_id - 1, next_id + len(conv.messages) - prefix - 1)))
+    conn.execute("DELETE FROM events WHERE conversation_id = ?", (conv_id,))
+    conn.executemany("INSERT OR REPLACE INTO events VALUES (?, ?, ?, ?, ?)",
+                     [(conv_id, e.event_id, e.kind, e.content, e.timestamp) for e in conv.events])
+    return existing is None, len(conv.messages) - prefix
 
 
 def session_exists(conn: sqlite3.Connection, session_id: str) -> bool:

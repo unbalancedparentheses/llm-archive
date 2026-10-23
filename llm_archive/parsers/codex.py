@@ -5,8 +5,10 @@ from pathlib import Path
 
 from llm_archive.parsers import ParsedConversation, ParsedMessage, normalize_project
 from llm_archive.strip import strip_code_blocks
+from llm_archive.parsers.events import tool_event, result_event
+from llm_archive.parsers.files import open_transcript, transcript_files
 
-CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
+CODEX_SESSIONS = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser() / "sessions"
 
 
 def _extract_project(cwd: str) -> str:
@@ -27,7 +29,7 @@ def parse_codex_sessions() -> Iterator[ParsedConversation]:
     if not CODEX_SESSIONS.is_dir():
         return
 
-    for jsonl_file in CODEX_SESSIONS.rglob("*.jsonl"):
+    for jsonl_file in transcript_files(CODEX_SESSIONS):
         conv = _parse_session(jsonl_file)
         if conv and conv.messages:
             yield conv
@@ -35,19 +37,27 @@ def parse_codex_sessions() -> Iterator[ParsedConversation]:
 
 def _parse_session(path: Path) -> ParsedConversation | None:
     messages = []
-    session_id = path.stem
+    events = []
+    git_branch = None
+    is_subagent = False
+    session_id = path.name.removesuffix(".zst").removesuffix(".jsonl")
     cwd = None
     started_at = None
+    repo_url = ""
 
     try:
-        with open(path) as f:
-            for line in f:
+        with open_transcript(path) as f:
+            for index, line in enumerate(f):
+                if not line.endswith("\n"):
+                    continue  # The writer may still be appending this record.
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
                     continue
 
                 msg_type = obj.get("type", "")
@@ -57,12 +67,25 @@ def _parse_session(path: Path) -> ParsedConversation | None:
                     session_id = payload.get("id", session_id)
                     cwd = payload.get("cwd")
                     started_at = payload.get("timestamp")
+                    git_branch = (payload.get("git") or {}).get("branch")
+                    repo_url = (payload.get("git") or {}).get("repository_url") or ""
+                    source = payload.get("source", {})
+                    is_subagent = isinstance(source, dict) and "subagent" in source
                     continue
 
                 if msg_type != "response_item":
                     continue
 
                 payload = obj.get("payload", {})
+                timestamp = obj.get("timestamp", "")
+                kind = payload.get("type")
+                if kind in ("function_call", "custom_tool_call"):
+                    events.append(tool_event(payload.get("call_id", str(index)), payload.get("name", "tool"),
+                                             payload.get("arguments", payload.get("input", "")), timestamp))
+                    continue
+                if kind in ("function_call_output", "custom_tool_call_output"):
+                    events.append(result_event(payload.get("call_id", str(index)), payload.get("output", ""), timestamp))
+                    continue
                 role = payload.get("role", "")
 
                 if role == "developer":
@@ -93,7 +116,12 @@ def _parse_session(path: Path) -> ParsedConversation | None:
         session_id=session_id,
         source="codex",
         project=_extract_project(cwd or ""),
-        git_branch=None,
+        git_branch=git_branch,
         started_at=started_at,
         messages=messages,
+        cwd=cwd or "",
+        source_path=str(path.resolve()),
+        is_subagent=is_subagent,
+        events=events,
+        repo_url=repo_url,
     )
