@@ -610,6 +610,20 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(len(recent_sessions(conn)), 1)
             conn.close()
 
+    def test_sync_removes_abandoned_transfer_files_but_not_recent_ones(self):
+        remote = self.root / "remote.git"
+        git(self.root, "init", "--bare", "--initial-branch=main", str(remote))
+        root = sync.configure(str(remote))
+        packs = root / ".git/objects/pack"
+        packs.mkdir(parents=True, exist_ok=True)
+        old, recent = packs / "tmp_pack_old", packs / "tmp_pack_recent"
+        old.write_bytes(b"x")
+        recent.write_bytes(b"x")
+        os.utime(old, (0, 0))
+        sync.run_sync(root)
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
+
     def test_offline_sync_keeps_local_capture_and_reports_failure(self):
         remote = self.root / "remote.git"
         git(self.root, "init", "--bare", "--initial-branch=main", str(remote))

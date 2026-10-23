@@ -32,7 +32,9 @@ def _git(root: Path, *args: str, check=True):
 def _git_environment():
     import os
     return {**os.environ, "GIT_TERMINAL_PROMPT": "0",
-            "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", "ssh") + " -o BatchMode=yes"}
+            # A connection left dead by sleep must fail fast instead of holding the collector lock.
+            "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", "ssh") + " -o BatchMode=yes"
+            " -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"}
 
 
 def configure(remote: str) -> Path:
@@ -189,6 +191,17 @@ def sync_if_configured() -> int:
     return run_sync(Path(config["sync_directory"]))
 
 
+def _remove_abandoned_packs(root: Path, age_seconds=3600):
+    """Interrupted transfers leave tmp_pack files that git gc never removes."""
+    import time
+    for path in (root / ".git/objects/pack").glob("tmp_pack_*"):
+        try:
+            if time.time() - path.stat().st_mtime > age_seconds:
+                path.unlink()
+        except OSError:
+            pass
+
+
 def _commit_export(conn, root: Path, message="Checkpoint work journal"):
     export_device(conn, root)
     _git(root, "add", "-A", "--", MARKER, f"devices/{device_id()}")
@@ -230,6 +243,7 @@ def run_sync(root: Path) -> int:
         conn = db.get_connection()
         try:
             _check_format(root)
+            _remove_abandoned_packs(root)
             _commit_export(conn, root)
             # Each device owns a separate path. Rebase unpushed checkpoints after
             # fetching other machines; never force-push or reset local history.
