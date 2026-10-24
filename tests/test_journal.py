@@ -643,3 +643,26 @@ class JournalTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GitOutputLocksTest(unittest.TestCase):
+    def test_read_only_git_never_takes_optional_locks(self):
+        # A status killed on its timeout must not leave .git/index.lock behind (concrete2 bug 209).
+        from llm_archive.projects import git_output
+        with tempfile.TemporaryDirectory() as d:
+            git(d, "init", "-q")
+            Path(d, "f").write_text("x")
+            git(d, "add", "f")
+            git(d, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x")
+            os.utime(Path(d, "f"), (1, 1))  # stale stat data: a plain status would refresh the index
+            before = Path(d, ".git", "index").stat().st_mtime_ns
+            seen = {}
+            real = subprocess.run
+            def spy(*a, **k):
+                seen.update(k.get("env") or {})
+                return real(*a, **k)
+            with patch("llm_archive.projects.subprocess.run", side_effect=spy):
+                self.assertIsNotNone(git_output(d, "status", "--short"))
+            self.assertEqual(seen.get("GIT_OPTIONAL_LOCKS"), "0")
+            self.assertEqual(Path(d, ".git", "index").stat().st_mtime_ns, before,
+                             "a read-only status rewrote the index")

@@ -10,9 +10,15 @@ from llm_archive.parsers import normalize_project
 
 
 def git_output(cwd: str, *args: str, timeout: float = 5) -> str | None:
+    # GIT_OPTIONAL_LOCKS=0: these calls only read, but `git status` refreshes the index under
+    # .git/index.lock whenever it can. A status killed by the timeout below cannot remove that lock,
+    # and the repository's next commit fails on "index.lock: File exists" (concrete2 bug 209: the
+    # handoff journal's 1 s status left empty locks in agent worktrees). Without optional locks it
+    # reads the index and writes nothing.
     try:
         result = subprocess.run(
             ["git", "-C", cwd, *args], capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
         return result.stdout.strip() if result.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired):
