@@ -640,11 +640,6 @@ class JournalTests(unittest.TestCase):
         self.assertTrue(db.get_state(conn)["last_success"])
         conn.close()
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class GitOutputLocksTest(unittest.TestCase):
     def test_read_only_git_never_takes_optional_locks(self):
         # A status killed on its timeout must not leave .git/index.lock behind (concrete2 bug 209).
@@ -666,3 +661,8 @@ class GitOutputLocksTest(unittest.TestCase):
             self.assertEqual(seen.get("GIT_OPTIONAL_LOCKS"), "0")
             self.assertEqual(Path(d, ".git", "index").stat().st_mtime_ns, before,
                              "a read-only status rewrote the index")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
